@@ -137,6 +137,25 @@ export function parseTabularLine(line: string): {
   if (!cleanLine) return null;
 
   // ----------------------------------------------------
+  // MODELO 0: Rotina 210 / WinThor / TOTVS Distribuição (Emitir Pedido de Compra)
+  // Ex: "84882 COLHER MESA C/12PCS LEME AZ 23183990 1X1 CJ 80,00 19,951000 0,00 19,951000 0,00 6,50..."
+  // Ex: "113021 FAQUEIRO 24PCS NEW KOLOR 23198/093 PRETO 23198/093 1X1 UN 60,00 30,286800..."
+  // Ex: "35402 FACA PEXEIRA INOX 5" 22902/005 C/12 22902005 1X1 CT 40,00 70,500000..."
+  // ----------------------------------------------------
+  const r210Regex = /^(\d{2,8})\s+(.+?)\s+([0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8})\s+(?:\(?\d+[xX]\d+\)?|\d+)\s+([A-ZÀ-Ü]{2,3})\s+(\d+(?:[,\.]\d+)?)\s+(\d+(?:[,\.]\d+)?)/i;
+  const r210Match = r210Regex.exec(cleanLine);
+  if (r210Match) {
+    const rawRef = r210Match[3];
+    const qtd = parseFloat(r210Match[5].replace(',', '.'));
+    return {
+      isMatch: true,
+      skuRef: normalizeTramontinaSku(rawRef),
+      quantidade: qtd,
+      embalagem: 1
+    };
+  }
+
+  // ----------------------------------------------------
   // MODELO 1: Ferreira Costa / MDC (ex: "360 UN-1-UN 63962072 3443876 7891116082409 COLHER CHA...")
   // ----------------------------------------------------
   const fcRegex = /^(\d+(?:[,\.]\d+)?)\s+([A-ZÀ-Ü]{2,3})-(\d+)-\2\s+([0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8})(?:\s+(\d{4,8}))?(?:\s+(789\d{10}|\d{13}))?\s*(.*)$/i;
@@ -654,6 +673,7 @@ export interface StoreSegment {
   label: string;
   text: string;
   cnpj?: string;
+  orderNumber?: string;
 }
 
 /**
@@ -677,10 +697,57 @@ export function extractCnpjFromText(text: string): string | undefined {
 }
 
 /**
- * Divide o texto do pedido por loja / filial quando houver múltiplas lojas no mesmo PDF
+ * Divide o texto do pedido por OC / Número do Pedido / Loja / Filial quando houver múltiplos pedidos no mesmo PDF
  */
 export function splitIntoStores(text: string): StoreSegment[] {
-  // 1. Casa Vieira (Rotina 210)
+  // 1. Detecção por Múltiplos Números de Pedido / OC / Ordem de Compra
+  const orderRegex = /(?:N[úu]mero\s+(?:do\s+)?Pedido|N[ºo°]\s*(?:do\s*)?Pedido|PEDIDO(?:\s+DE\s+COMPRA[S]?)?|ORDEM\s+DE\s+COMPRA|O\.?C\.?)\s*[:#.]?\s*([0-9A-Z\/\-_]{3,15})/gi;
+  const orderMatches: Array<{ index: number; orderNumber: string; filial?: string }> = [];
+  let ordM: RegExpExecArray | null;
+
+  while ((ordM = orderRegex.exec(text)) !== null) {
+    const orderNumber = ordM[1].trim();
+    // Procura por Filial ou Loja nas proximidades (até 120 caracteres)
+    const context = text.slice(ordM.index, Math.min(text.length, ordM.index + 120));
+    const filialMatch = /(?:Filial|Loja|Unidade)\s*[:#.]?\s*(\d+|[A-Z0-9\s—–-]+?)(?:\s+Data|\s+COMPRA|\s+CNPJ|\s+Fornecedor|\n|\r|$)/i.exec(context);
+    const filial = filialMatch ? filialMatch[1].trim() : undefined;
+    orderMatches.push({ index: ordM.index, orderNumber, filial });
+  }
+
+  // Agrupa primeiras ocorrências de cada número de pedido distinto
+  const distinctOrders: Array<{ index: number; orderNumber: string; filial?: string }> = [];
+  const seenOrders = new Set<string>();
+
+  orderMatches.forEach(om => {
+    if (!seenOrders.has(om.orderNumber)) {
+      seenOrders.add(om.orderNumber);
+      distinctOrders.push(om);
+    }
+  });
+
+  if (distinctOrders.length >= 2) {
+    distinctOrders.sort((a, b) => a.index - b.index);
+    const segments: StoreSegment[] = [];
+    for (let i = 0; i < distinctOrders.length; i++) {
+      const start = i === 0 ? 0 : distinctOrders[i].index - 30;
+      const end = i + 1 < distinctOrders.length ? distinctOrders[i + 1].index - 30 : text.length;
+      const sliceText = text.slice(Math.max(0, start), end);
+      const cnpj = extractCnpjFromText(sliceText);
+      const occ = distinctOrders[i];
+      const filialStr = occ.filial ? ` · Filial ${occ.filial}` : '';
+      const cnpjStr = cnpj ? ` (CNPJ: ${cnpj})` : '';
+      const label = `OC ${occ.orderNumber}${filialStr}${cnpjStr}`;
+      segments.push({
+        label,
+        text: sliceText,
+        cnpj,
+        orderNumber: occ.orderNumber
+      });
+    }
+    return segments;
+  }
+
+  // 2. Casa Vieira (Rotina 210)
   const cvStoreRegex = /Empresa\s+(\d+)\s+([A-Z0-9\s\.\-—–]+?)(?:\s+CNPJ|\s+IE|\s+UF|\n|\r)/gi;
   const cvMatches: Array<{ index: number; label: string; empNum: string }> = [];
   let cvM: RegExpExecArray | null;
@@ -707,15 +774,16 @@ export function splitIntoStores(text: string): StoreSegment[] {
     return segments;
   }
 
-  // 2. Consinco / TOTVS / Centerbox
+  // 3. Consinco / TOTVS / Centerbox
   const consincoStoreRegex = /PEDIDO\s+DE\s+COMPRAS\s+([0-9A-Z\/]+)[\s\S]{1,120}?R\.\s*Social\s+([^\n\r]+)/gi;
-  const consincoMatches: Array<{ index: number; label: string }> = [];
+  const consincoMatches: Array<{ index: number; label: string; pedNum: string }> = [];
   let conM: RegExpExecArray | null;
   while ((conM = consincoStoreRegex.exec(text)) !== null) {
     const pedNum = conM[1];
     const rSocial = conM[2].replace(/[=\|]+/g, '').trim();
     consincoMatches.push({
       index: conM.index,
+      pedNum,
       label: `Ped. ${pedNum} — ${rSocial}`
     });
   }
@@ -728,12 +796,12 @@ export function splitIntoStores(text: string): StoreSegment[] {
       const sliceText = text.slice(start, end);
       const cnpj = extractCnpjFromText(sliceText);
       const label = cnpj ? `${consincoMatches[i].label} (CNPJ: ${cnpj})` : consincoMatches[i].label;
-      segments.push({ label, text: sliceText, cnpj });
+      segments.push({ label, text: sliceText, cnpj, orderNumber: consincoMatches[i].pedNum });
     }
     return segments;
   }
 
-  // 3. Loja / Filial explícita
+  // 4. Loja / Filial explícita
   const lojaRegex = /(?:===+\s*)?(?:LOJA\s+(\d+|[A-Z0-9\s—–-]+)|FILIAL(?:\s+DE\s+DESTINO)?\s*[:\s]+(\d+|[A-Z0-9\s—–-]+))(?:\s*[:—–-]\s*([^\n\r]+))?/gi;
   const lojaMatches: Array<{ index: number; label: string }> = [];
   let m: RegExpExecArray | null;
@@ -761,7 +829,7 @@ export function splitIntoStores(text: string): StoreSegment[] {
     return segments;
   }
 
-  // 4. Detecção por múltiplos CNPJs no documento
+  // 5. Detecção por múltiplos CNPJs no documento
   const allCnpjs: Array<{ index: number; cnpj: string }> = [];
   const cnpjGlobalRegex = /\b(\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2})\b/g;
   let cMatch: RegExpExecArray | null;
@@ -772,7 +840,6 @@ export function splitIntoStores(text: string): StoreSegment[] {
   // Se tiver 2 ou mais CNPJs distintos
   const uniqueCnpjSet = new Set(allCnpjs.map(c => c.cnpj));
   if (uniqueCnpjSet.size >= 2) {
-    // Usamos os pontos de ocorrência de CNPJs para fatiar
     const distinctFirstOccurrences: Array<{ index: number; cnpj: string }> = [];
     const seenC = new Set<string>();
     allCnpjs.forEach(c => {
@@ -800,7 +867,8 @@ export function splitIntoStores(text: string): StoreSegment[] {
     }
   }
 
-  // 5. Identificação por cabeçalho em loja única
+  // 6. Identificação por cabeçalho em loja/pedido único
+  const singleOrder = distinctOrders.length === 1 ? distinctOrders[0] : null;
   const fcHeaderMatch = /TRAMONTINA\s+MAD\s+(\d+)/i.exec(text);
   const destMatch = /Loja\s+Destino[\s\S]{1,60}?(MDC[^\n\r]*|FERREIRA\s+COSTA[^\n\r]*)/i.exec(text);
   const carajasMatch = /Ref\.:\s*(?:\(Referência do Local\)\s*)?([^\n\r]+)/i.exec(text);
@@ -808,7 +876,10 @@ export function splitIntoStores(text: string): StoreSegment[] {
   const singleCnpj = extractCnpjFromText(text);
   
   let defaultLabel = 'Loja Principal';
-  if (fcHeaderMatch && destMatch) {
+  if (singleOrder) {
+    const filialStr = singleOrder.filial ? ` · Filial ${singleOrder.filial}` : '';
+    defaultLabel = `OC ${singleOrder.orderNumber}${filialStr}`;
+  } else if (fcHeaderMatch && destMatch) {
     defaultLabel = `TRAMONTINA MAD ${fcHeaderMatch[1]} — ${destMatch[1].trim()}`;
   } else if (fcHeaderMatch) {
     defaultLabel = `TRAMONTINA MAD ${fcHeaderMatch[1]}`;
@@ -822,7 +893,12 @@ export function splitIntoStores(text: string): StoreSegment[] {
     defaultLabel = `CNPJ: ${singleCnpj}`;
   }
 
-  return [{ label: defaultLabel, text, cnpj: singleCnpj }];
+  return [{
+    label: defaultLabel,
+    text,
+    cnpj: singleCnpj,
+    orderNumber: singleOrder ? singleOrder.orderNumber : undefined
+  }];
 }
 
 /**
@@ -836,7 +912,7 @@ export function extractSkusFromText(
   origem: OrigemType,
   separarLoja: boolean
 ): OrderItem[] {
-  // Sempre identifica lojas / filiais e CNPJs para garantir a integridade dos dados
+  // Identifica OCs / lojas / filiais e CNPJs para garantir a integridade dos dados
   const segments = splitIntoStores(text);
   const allItems: OrderItem[] = [];
 
@@ -844,7 +920,7 @@ export function extractSkusFromText(
     const lines = seg.text.split(/[\r\n]+/);
     const storeItems: OrderItem[] = [];
     const processedLineIndices = new Set<number>();
-    const effectiveLabel = separarLoja ? seg.label : 'Loja Principal';
+    const effectiveLabel = (separarLoja || segments.length > 1) ? seg.label : 'Loja Principal';
 
     // 1º Passo: Executa o parser estruturado linha por linha
     lines.forEach((line, lineIdx) => {
@@ -873,6 +949,7 @@ export function extractSkusFromText(
             desconto: 0,
             source: sourceName,
             loja: effectiveLabel,
+            orderNumber: seg.orderNumber,
             cnpj: seg.cnpj,
             detectedType: isEan ? 'ean13' : 'tramontina_ref',
             isValidSku: isEan ? false : isValidTramontinaSku(chosenSku)
@@ -905,6 +982,7 @@ export function extractSkusFromText(
               desconto: 0,
               source: sourceName,
               loja: effectiveLabel,
+              orderNumber: seg.orderNumber,
               cnpj: seg.cnpj,
               detectedType: d.detectedType,
               isValidSku: isValidTramontinaSku(d.sku)
@@ -931,6 +1009,7 @@ export function extractSkusFromText(
       desconto: 0,
       source: sourceName,
       loja: effectiveLabel,
+      orderNumber: seg.orderNumber,
       cnpj: seg.cnpj,
       detectedType: d.detectedType,
       isValidSku: isValidTramontinaSku(d.sku)
@@ -943,10 +1022,10 @@ export function extractSkusFromText(
 }
 
 /**
- * Deduplica itens estritamente POR CNPJ / LOJA:
- * Se um mesmo SKU estiver presente na Loja 1 e na Loja 2 da mesma OC,
+ * Deduplica itens estritamente POR OC / CNPJ / LOJA:
+ * Se um mesmo SKU estiver presente na OC 1 e na OC 2,
  * AMBOS os itens são preservados para faturamento independente!
- * Apenas duplicatas do MESMO SKU dentro do MESMO CNPJ / Loja são consolidadas.
+ * Apenas duplicatas do MESMO SKU dentro da MESMA OC / Loja são consolidadas.
  */
 export function dedupeItems(list: OrderItem[]): OrderItem[] {
   const map = new Map<string, OrderItem>();
@@ -955,8 +1034,8 @@ export function dedupeItems(list: OrderItem[]): OrderItem[] {
     const cleanSku = item.sku.replace(/[\/\-\.\s]/g, '');
     if (!cleanSku) return;
 
-    // Chave única composta por CNPJ ou Loja + SKU
-    const storeKey = (item.cnpj || item.loja || item.source || 'loja-padrao')
+    // Chave única composta por OC / Loja / CNPJ + SKU
+    const storeKey = (item.orderNumber || item.loja || item.cnpj || item.source || 'loja-padrao')
       .trim()
       .toLowerCase();
     
@@ -965,7 +1044,7 @@ export function dedupeItems(list: OrderItem[]): OrderItem[] {
     if (!map.has(uniqueKey)) {
       map.set(uniqueKey, { ...item });
     } else {
-      // Se duplicado no mesmo CNPJ/loja, soma as quantidades e preserva 1 registro único por CNPJ
+      // Se duplicado na mesma OC/loja, soma as quantidades e preserva 1 registro único
       const existing = map.get(uniqueKey)!;
       const currentQty = typeof existing.quantidade === 'number' ? existing.quantidade : parseFloat(String(existing.quantidade).replace(',', '.')) || 0;
       const newQty = typeof item.quantidade === 'number' ? item.quantidade : parseFloat(String(item.quantidade).replace(',', '.')) || 0;

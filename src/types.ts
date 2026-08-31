@@ -11,6 +11,7 @@ export interface OrderItem {
   desconto: number | string;
   source: string;
   loja: string;
+  orderNumber?: string;
   cnpj?: string;
   detectedType: 'tramontina_ref' | 'ean13' | 'manual';
   isValidSku?: boolean;
@@ -30,6 +31,7 @@ export interface UploadedPdfFile {
 
 export interface StoreGroup {
   loja: string;
+  orderNumber?: string;
   cnpj?: string;
   items: OrderItem[];
   totalQty: number;

@@ -227,7 +227,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
                 className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-bold rounded-lg bg-[#004B87] hover:bg-[#003B6D] text-white shadow-sm transition-all cursor-pointer active:scale-95"
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>Baixar Todas as Lojas ({storeGroups.length})</span>
+                <span>Baixar Todas as OCs / Lojas ({storeGroups.length})</span>
               </button>
             )}
           </div>
@@ -522,12 +522,19 @@ const TableRow: React.FC<TableRowProps> = ({ row, index, onUpdate, onDelete }) =
         />
       </td>
 
-      {/* Source & CNPJ */}
+      {/* Source & CNPJ / OC */}
       <td className="py-2 px-3 text-slate-500 font-sans text-[11px] max-w-xs" title={row.source}>
         <div className="truncate font-medium text-slate-600">{row.source}</div>
-        {row.cnpj && (
-          <div className="text-[10px] text-[#004B87] font-mono font-medium">CNPJ: {row.cnpj}</div>
-        )}
+        <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+          {row.orderNumber && (
+            <span className="inline-flex items-center px-1.5 py-0.2 rounded text-[10px] bg-blue-50 text-[#004B87] font-mono font-semibold border border-blue-200/60">
+              OC: {row.orderNumber}
+            </span>
+          )}
+          {row.cnpj && (
+            <span className="text-[10px] text-slate-500 font-mono">CNPJ: {row.cnpj}</span>
+          )}
+        </div>
       </td>
 
       {/* Remove Button */}

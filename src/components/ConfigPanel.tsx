@@ -173,7 +173,7 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({
                 className="w-4 h-4 rounded text-[#004B87] accent-[#004B87] border-slate-300 focus:ring-[#004B87]"
               />
               <span className="font-medium">
-                Separar por loja <span className="text-slate-400 font-normal">(Multi-CNPJ / Filiais no PDF)</span>
+                Separar por Loja / OC <span className="text-slate-400 font-normal">(Multi-OC, CNPJ ou Filiais)</span>
               </span>
             </label>
           </div>
