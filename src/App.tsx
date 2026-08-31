@@ -283,7 +283,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <span className="font-bold text-[#004B87]">Tramontina</span>
             <span>•</span>
-            <span>Sistema de conversão de Pedidos para ERP</span>
+            <span>Sistema de conversão de planilhas para Sales Force</span>
           </div>
           <div className="text-slate-500 font-medium">
             Desenvolvido por: Rafael Luft
