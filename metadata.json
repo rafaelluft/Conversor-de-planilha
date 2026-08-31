@@ -1,0 +1,6 @@
+{
+  "name": "Conversor de Planilha Tramontina",
+  "description": "Conversor inteligente de ordens de compra em PDF para planilhas de pedidos prontas para o sistema Tramontina (VP e CD).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
