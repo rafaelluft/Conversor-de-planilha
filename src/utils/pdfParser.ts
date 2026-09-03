@@ -699,26 +699,54 @@ export function extractCnpjFromText(text: string): string | undefined {
 /**
  * Divide o texto do pedido por OC / Número do Pedido / Loja / Filial quando houver múltiplos pedidos no mesmo PDF
  */
-export function splitIntoStores(text: string): StoreSegment[] {
-  // 1. Detecção por Múltiplos Números de Pedido / OC / Ordem de Compra
-  const orderRegex = /(?:N[úu]mero\s+(?:do\s+)?Pedido|N[ºo°]\s*(?:do\s*)?Pedido|PEDIDO(?:\s+DE\s+COMPRA[S]?)?|ORDEM\s+DE\s+COMPRA|O\.?C\.?)\s*[:#.]?\s*([0-9A-Z\/\-_]{3,15})/gi;
-  const orderMatches: Array<{ index: number; orderNumber: string; filial?: string }> = [];
-  let ordM: RegExpExecArray | null;
+export function extractOrderOccurrences(text: string): Array<{ index: number; orderNumber: string; filial?: string }> {
+  const occurrences: Array<{ index: number; orderNumber: string; filial?: string }> = [];
 
-  while ((ordM = orderRegex.exec(text)) !== null) {
-    const orderNumber = ordM[1].trim();
-    // Procura por Filial ou Loja nas proximidades (até 120 caracteres)
-    const context = text.slice(ordM.index, Math.min(text.length, ordM.index + 120));
-    const filialMatch = /(?:Filial|Loja|Unidade)\s*[:#.]?\s*(\d+|[A-Z0-9\s—–-]+?)(?:\s+Data|\s+COMPRA|\s+CNPJ|\s+Fornecedor|\n|\r|$)/i.exec(context);
-    const filial = filialMatch ? filialMatch[1].trim() : undefined;
-    orderMatches.push({ index: ordM.index, orderNumber, filial });
+  // Padrão 1: MDC / Ferreira Costa (ex: "PEDIDO - XPED\n1842749" ou "PEDIDO - XPED 1842749")
+  const mdcOrderRegex = /PEDIDO\s*[-–—]\s*XPED[\s\r\n]+(\d{4,12})/gi;
+  let mdcM: RegExpExecArray | null;
+  while ((mdcM = mdcOrderRegex.exec(text)) !== null) {
+    occurrences.push({ index: mdcM.index, orderNumber: mdcM[1] });
   }
 
-  // Agrupa primeiras ocorrências de cada número de pedido distinto
+  // Padrão 2: Rotina 210 / WinThor (ex: "Número do Pedido: 129220 Filial: 1")
+  const winthorOrderRegex = /N[úu]mero\s+(?:do\s+)?Pedido\s*[:\s]+(\d{4,12})(?:[\s\S]{0,40}?(?:Filial|Loja|Unid)\s*[:\s]+(\d+|[A-Z0-9\s—–-]+?)(?:\s+Data|\s+COMPRA|\s+CNPJ|\n|\r|$))?/gi;
+  let winM: RegExpExecArray | null;
+  while ((winM = winthorOrderRegex.exec(text)) !== null) {
+    occurrences.push({
+      index: winM.index,
+      orderNumber: winM[1],
+      filial: winM[2] ? winM[2].trim() : undefined
+    });
+  }
+
+  // Padrão 3: Consinco / TOTVS / Centerbox (ex: "PEDIDO DE COMPRAS 456789")
+  const consincoOrderRegex = /PEDIDO\s+DE\s+COMPRAS?\s*[:\s]+(\d{4,12})/gi;
+  let conM: RegExpExecArray | null;
+  while ((conM = consincoOrderRegex.exec(text)) !== null) {
+    occurrences.push({ index: conM.index, orderNumber: conM[1] });
+  }
+
+  // Padrão 4: Ordem de Compra / OC (ex: "ORDEM DE COMPRA: 123456" ou "Nº OC: 987654")
+  const genericOcRegex = /(?:ORDEM\s+DE\s+COMPRA|N[ºo°]\s*DA\s+O\.?C\.?|N[úu]mero\s+da\s+OC|N[ºo°]\s*do\s+Pedido|O\.?C\.?\s*[:#])\s*[:#.\s]*(\d{4,12})/gi;
+  let ocM: RegExpExecArray | null;
+  while ((ocM = genericOcRegex.exec(text)) !== null) {
+    occurrences.push({ index: ocM.index, orderNumber: ocM[1] });
+  }
+
+  return occurrences;
+}
+
+/**
+ * Divide o texto do pedido por OC / Número do Pedido / Loja / Filial quando houver múltiplos pedidos no mesmo PDF
+ */
+export function splitIntoStores(text: string): StoreSegment[] {
+  // 1. Detecção por Múltiplos Números de Pedido / OC
+  const allOrderOccurrences = extractOrderOccurrences(text);
   const distinctOrders: Array<{ index: number; orderNumber: string; filial?: string }> = [];
   const seenOrders = new Set<string>();
 
-  orderMatches.forEach(om => {
+  allOrderOccurrences.forEach(om => {
     if (!seenOrders.has(om.orderNumber)) {
       seenOrders.add(om.orderNumber);
       distinctOrders.push(om);
@@ -735,8 +763,7 @@ export function splitIntoStores(text: string): StoreSegment[] {
       const cnpj = extractCnpjFromText(sliceText);
       const occ = distinctOrders[i];
       const filialStr = occ.filial ? ` · Filial ${occ.filial}` : '';
-      const cnpjStr = cnpj ? ` (CNPJ: ${cnpj})` : '';
-      const label = `OC ${occ.orderNumber}${filialStr}${cnpjStr}`;
+      const label = `OC ${occ.orderNumber}${filialStr}`;
       segments.push({
         label,
         text: sliceText,
@@ -829,7 +856,8 @@ export function splitIntoStores(text: string): StoreSegment[] {
     return segments;
   }
 
-  // 5. Detecção por múltiplos CNPJs no documento
+  // 5. Detecção por múltiplos CNPJs no documento (apenas quando não for pedido único com Faturamento/Entrega)
+  const isVendaOrdemMdc = /MDC\s+DISTRIBUIDORA|PEDIDO\s*[-–—]\s*XPED|TRAMONTINA\s+MAD\s+\d+/i.test(text);
   const allCnpjs: Array<{ index: number; cnpj: string }> = [];
   const cnpjGlobalRegex = /\b(\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2})\b/g;
   let cMatch: RegExpExecArray | null;
@@ -837,9 +865,9 @@ export function splitIntoStores(text: string): StoreSegment[] {
     allCnpjs.push({ index: cMatch.index, cnpj: cMatch[1] });
   }
 
-  // Se tiver 2 ou mais CNPJs distintos
+  // Se tiver 2 ou mais CNPJs distintos, mas NÃO for pedido único identificado nem Venda à Ordem
   const uniqueCnpjSet = new Set(allCnpjs.map(c => c.cnpj));
-  if (uniqueCnpjSet.size >= 2) {
+  if (uniqueCnpjSet.size >= 2 && !isVendaOrdemMdc && distinctOrders.length === 0) {
     const distinctFirstOccurrences: Array<{ index: number; cnpj: string }> = [];
     const seenC = new Set<string>();
     allCnpjs.forEach(c => {
@@ -878,7 +906,8 @@ export function splitIntoStores(text: string): StoreSegment[] {
   let defaultLabel = 'Loja Principal';
   if (singleOrder) {
     const filialStr = singleOrder.filial ? ` · Filial ${singleOrder.filial}` : '';
-    defaultLabel = `OC ${singleOrder.orderNumber}${filialStr}`;
+    const madStr = fcHeaderMatch ? ` · TRAMONTINA MAD ${fcHeaderMatch[1]}` : '';
+    defaultLabel = `OC ${singleOrder.orderNumber}${filialStr}${madStr}`;
   } else if (fcHeaderMatch && destMatch) {
     defaultLabel = `TRAMONTINA MAD ${fcHeaderMatch[1]} — ${destMatch[1].trim()}`;
   } else if (fcHeaderMatch) {

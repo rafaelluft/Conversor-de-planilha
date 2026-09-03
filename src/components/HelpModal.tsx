@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Layers, CheckCircle2, ShieldCheck, FileSpreadsheet, Building2, HelpCircle } from 'lucide-react';
+import { X, Layers, CheckCircle2, ShieldCheck, FileSpreadsheet, Building2, HelpCircle, AlertTriangle } from 'lucide-react';
 
 interface HelpModalProps {
   isOpen: boolean;
@@ -38,6 +38,26 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
         {/* Content */}
         <div className="p-6 overflow-y-auto space-y-5 text-xs text-slate-700 leading-relaxed">
           
+          {/* Card de Atenção sobre Tipo de PDF */}
+          <div className="bg-amber-50/90 border border-amber-300 rounded-xl p-4 text-amber-950 shadow-xs">
+            <div className="flex items-start gap-3">
+              <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-400/30 flex items-center justify-center shrink-0 mt-0.5">
+                <AlertTriangle className="w-4 h-4 text-amber-700" />
+              </div>
+              <div className="space-y-1">
+                <h4 className="font-bold text-amber-900 text-sm">
+                  Atenção: Tipo de Arquivo PDF Suportado
+                </h4>
+                <p className="text-amber-900 text-xs leading-relaxed">
+                  <strong>Atenção:</strong> Só é possível a leitura do PDF se for um PDF de texto. Para casos em que o cliente envia o PDF salvo como &quot;print para PDF&quot; ele não reconhece pois transforma os textos em imagens, impossibilitando de ler o arquivo.
+                </p>
+                <p className="text-[11px] text-amber-800/90 pt-1">
+                  💡 <em>Dica prática:</em> Abra o arquivo no leitor de PDF e tente selecionar ou copiar qualquer texto com o mouse. Se conseguir selecionar o texto normalmente, o arquivo será processado com sucesso.
+                </p>
+              </div>
+            </div>
+          </div>
+
           {/* Section 1 */}
           <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-4">
             <div className="flex items-center gap-2 font-bold text-slate-900 text-sm mb-2">
