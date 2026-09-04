@@ -3,10 +3,14 @@ import { OrderItem, OrigemType, SkuExtractionMode } from '../types';
 
 // Set worker source with reliable fallback for Vite / browser environments
 if (typeof window !== 'undefined') {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.min.mjs',
-    import.meta.url
-  ).toString();
+  try {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+      'pdfjs-dist/build/pdf.worker.min.js',
+      import.meta.url
+    ).toString();
+  } catch {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version || '3.11.174'}/pdf.worker.min.js`;
+  }
 }
 
 export interface CodeMatch {
@@ -548,7 +552,8 @@ export function attachPackagingAndQuantity(
   const boxQtyFirst = new RegExp('(\\d+(?:[,\.]\d+)?)\\s*' + boxQtyFirstLabel + '\\.?' + SEP + '(\\d+)\\b(?!-)', 'i');
   const boxLabelFirst = new RegExp('\\b' + boxLabel + '\\.?' + SEP + '(\\d+)\\s+(\\d+(?:[,\.]\d+)?)\\b(?!-)', 'i');
   const unitQty = new RegExp('\\b' + unitLabel + '\\.?' + SEP + '(\\d+(?:[,\.]\d+)?)\\b(?!-)', 'i');
-  const unitQtyBefore = new RegExp('(?<![Xx0-9])(\\d+(?:[,\.]\d+)?)\\s*' + unitLabel + '\\b(?!-)', 'i');
+  // Substituição de lookbehind (?<![Xx0-9]) por regex padrão compatível com Safari/WebKit
+  const unitQtyBefore = new RegExp('(?:^|[^Xx0-9])(\\d+(?:[,\.]\d+)?)\\s*' + unitLabel + '\\b(?!-)', 'i');
   
   // Rótulos diretos de Embalagem e Quantidade
   const embOnlyRegex = /\b(?:EMB(?:ALAGEM)?|CXA?\.?|CAIXA|M[UÚ]LT(?:IPLO)?|FATOR)\s*[:=\-]?\s*(\d+)/i;
@@ -593,9 +598,12 @@ export function attachPackagingAndQuantity(
 
     const beforeMatches = findAllMatches(win, unitQtyBefore);
     beforeMatches.forEach(m => {
+      const numOffset = m[0].indexOf(m[1]);
+      const actualPos = m.index + (numOffset >= 0 ? numOffset : 0);
+      const actualLen = m[0].length - (numOffset >= 0 ? numOffset : 0);
       candidates.push({
-        pos: m.index,
-        len: m[0].length,
+        pos: actualPos,
+        len: actualLen,
         data: { embalagem: 1, quantidade: parseFloat(m[1].replace(',', '.')) }
       });
     });
