@@ -104,11 +104,12 @@ export async function extractTextFromPdf(file: File): Promise<{ text: string; pa
         }
       });
 
-      const structuredPageText = pageLines.join('\n');
+      const rawPageText = pageLines.join('\n');
+      const structuredPageText = rejoinBrokenCodes(rawPageText);
       if (structuredPageText.trim().length > 0) {
         fullDocumentText += structuredPageText + '\n\n';
       } else if (rawSequentialText.trim().length > 0) {
-        fullDocumentText += rawSequentialText + '\n\n';
+        fullDocumentText += rejoinBrokenCodes(rawSequentialText) + '\n\n';
       }
     }
 
@@ -117,6 +118,195 @@ export async function extractTextFromPdf(file: File): Promise<{ text: string; pa
     console.error('Erro ao ler PDF:', err);
     throw err;
   }
+}
+
+/**
+ * Une códigos de referência e EAN que venham quebrados na linha de baixo.
+ * Em alguns PDFs ou relatórios (ex: Hiper Atacado, Consinco, TOTVS),
+ * a coluna é estreita e referências como "23183/30" têm o último dígito "0"
+ * quebrado na linha seguinte, ou EANs de 13 dígitos como "78911120172" têm
+ * os últimos 2 dígitos "14" na linha seguinte.
+ * Esta função detecta quando na linha há menos dígitos do que os padrões
+ * de Ref Tramontina (5/3 ou 8 dígitos) e EAN (13 dígitos) e junta com
+ * os números da linha de baixo, reconstruindo a linha de forma íntegra.
+ */
+export function rejoinBrokenCodes(text: string): string {
+  if (!text) return '';
+
+  const rawLines = text.split(/\r?\n/);
+  const lines = rawLines.map(l => l.trim()).filter(l => l.length > 0);
+
+  // PASSO 1: Junção Sequencial / Vertical (quando cada pedaço quebrado ficou em linhas sucessivas)
+  const step1Lines: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    let curr = lines[i];
+
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1];
+      let merged = false;
+
+      // 1.1 Linha termina com referência incompleta com barra (ex: "23183/30" ou "23183/")
+      const slashMatch = /(?:^|\s)(\d{5}\/(?:\d{1,2})?)$/.exec(curr);
+      if (slashMatch) {
+        const rawRef = slashMatch[1];
+        const slashPos = rawRef.indexOf('/');
+        const needed = 3 - (rawRef.length - slashPos - 1);
+        const nextMatch = new RegExp('^(\\d{' + needed + '})(?:\\s+(.*)|$)').exec(next);
+        if (nextMatch) {
+          const completedRef = rawRef + nextMatch[1];
+          curr = curr.slice(0, curr.length - rawRef.length) + completedRef;
+          if (nextMatch[2] && nextMatch[2].trim()) {
+            lines[i + 1] = nextMatch[2].trim();
+          } else {
+            i++;
+          }
+          merged = true;
+          continue;
+        }
+      }
+
+      // 1.2 Linha termina com 5 dígitos numéricos e a próxima começa com "/300"
+      const slashContMatch = /(?:^|\s)(\d{5})$/.exec(curr);
+      if (slashContMatch) {
+        const nextSlash = /^(\/\d{3})(?:\s+(.*)|$)/.exec(next);
+        if (nextSlash) {
+          curr = curr + nextSlash[1];
+          if (nextSlash[2] && nextSlash[2].trim()) {
+            lines[i + 1] = nextSlash[2].trim();
+          } else {
+            i++;
+          }
+          merged = true;
+          continue;
+        }
+      }
+
+      // 1.3 Linha termina com EAN incompleto (ex: "78911120172" com 11 dígitos, precisa de 2)
+      const eanMatch = /(?:^|\s)((?:789|790)\d{7,11}|\d{10,12})$/.exec(curr);
+      if (eanMatch) {
+        const rawEan = eanMatch[1];
+        const needed = 13 - rawEan.length;
+        const nextMatch = new RegExp('^(\\d{' + needed + '})(?:\\s+(.*)|$)').exec(next);
+        if (nextMatch) {
+          const completedEan = rawEan + nextMatch[1];
+          curr = curr.slice(0, curr.length - rawEan.length) + completedEan;
+          if (nextMatch[2] && nextMatch[2].trim()) {
+            lines[i + 1] = nextMatch[2].trim();
+          } else {
+            i++;
+          }
+          merged = true;
+          continue;
+        }
+      }
+
+      // 1.4 Unidade de medida isolada (ex: "CX") seguida de número de embalagem (ex: "12")
+      if (/^(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)$/i.test(curr) && /^\d+$/.test(next)) {
+        curr = `${curr} ${next}`;
+        i++;
+        merged = true;
+        continue;
+      }
+
+      // 1.5 Decimal de quantidade isolado (ex: "3,0" seguido de "0" -> "3,00")
+      if (/^\d+,\d*$/.test(curr) && /^\d+$/.test(next)) {
+        curr = `${curr}${next}`;
+        i++;
+        merged = true;
+        continue;
+      }
+
+      if (!merged) break;
+    }
+
+    step1Lines.push(curr);
+  }
+
+  // PASSO 2: Junção Tabular Multilinha (quando uma linha de tabela quebrou em Linha A e Linha B de continuação)
+  const finalLines: string[] = [];
+  for (let i = 0; i < step1Lines.length; i++) {
+    let curr = step1Lines[i];
+
+    // Verifica se a linha atual contém uma ref quebrada ou um EAN quebrado
+    const brokenSlashRef = /\b(\d{5}\/(?:\d{1,2})?)\b/.exec(curr);
+    const brokenEan = /\b((?:789|790)\d{7,11}|\d{10,12})\b/.exec(curr);
+
+    if ((brokenSlashRef || brokenEan) && i + 1 < step1Lines.length) {
+      const next = step1Lines[i + 1];
+      const nextTokens = next.split(/\s+/);
+      let tIdx = 0;
+      let handled = false;
+
+      // Se a ref na linha atual é '-' ou um traço, pula traço inicial da próxima linha se houver
+      if (nextTokens[tIdx] === '-') {
+        tIdx++;
+      }
+
+      // Se a ref estava quebrada com barra (ex: "23183/30" precisa de 1 dígito)
+      if (brokenSlashRef) {
+        const rawRef = brokenSlashRef[1];
+        const slashPos = rawRef.indexOf('/');
+        const needed = 3 - (rawRef.length - slashPos - 1);
+        if (tIdx < nextTokens.length && new RegExp('^\\d{' + needed + '}$').test(nextTokens[tIdx])) {
+          curr = curr.replace(rawRef, rawRef + nextTokens[tIdx]);
+          tIdx++;
+          handled = true;
+        }
+      }
+
+      // Se o EAN estava quebrado (ex: 11 dígitos precisa de 2)
+      if (brokenEan) {
+        if (nextTokens[tIdx] === '-') tIdx++;
+        const rawEan = brokenEan[1];
+        const needed = 13 - rawEan.length;
+        if (tIdx < nextTokens.length && new RegExp('^\\d{' + needed + '}$').test(nextTokens[tIdx])) {
+          curr = curr.replace(rawEan, rawEan + nextTokens[tIdx]);
+          tIdx++;
+          handled = true;
+        }
+      }
+
+      if (handled) {
+        const remaining = nextTokens.slice(tIdx);
+        let extraEmb: string | null = null;
+        let extraQtdDec: string | null = null;
+
+        if (remaining.length >= 2 && /^\d+$/.test(remaining[remaining.length - 2]) && /^\d+$/.test(remaining[remaining.length - 1])) {
+          extraEmb = remaining[remaining.length - 2];
+          extraQtdDec = remaining[remaining.length - 1];
+          remaining.splice(remaining.length - 2, 2);
+        } else if (remaining.length === 1 && /^\d+$/.test(remaining[0])) {
+          extraEmb = remaining.pop()!;
+        }
+
+        // Se encontrou número de embalagem e/ou decimal da quantidade
+        if (extraEmb) {
+          curr = curr.replace(/\b(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)\b\s*(\d+,\d*)/i, `$1 ${extraEmb} $2${extraQtdDec || ''}`);
+        } else if (extraQtdDec) {
+          curr = curr.replace(/\b(\d+,\d*)\b(?=\s+\d+,\d+)/, `$1${extraQtdDec}`);
+        }
+
+        // Se restou texto da descrição (ex: 'INOX' ou 'UNIVERSAL - REF: 22921/106')
+        if (remaining.length > 0) {
+          const filtered = remaining.filter(w => !new RegExp('\\b' + w + '\\b', 'i').test(curr));
+          if (filtered.length > 0) {
+            const extraDesc = filtered.join(' ');
+            if (/\b(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)\b/i.test(curr)) {
+              curr = curr.replace(/\b(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)\b/i, `${extraDesc} $1`);
+            } else {
+              curr += ' ' + extraDesc;
+            }
+          }
+        }
+
+        i++; // Linha seguinte consumida com sucesso
+      }
+    }
+
+    finalLines.push(curr);
+  }
+
+  return finalLines.join('\n');
 }
 
 /**
@@ -341,6 +531,38 @@ export function parseTabularLine(line: string): {
   }
 
   // ----------------------------------------------------
+  // MODELO 8: Hiper Atacado / Pedidos Reconstruídos Multilinha
+  // Ex: "22303300 7891112017214 CONJ COLHER TRAMONTINA C/3 PCS CABO MADEIR CX 12 3,00 192,56 577,68 0,00"
+  // Ex: "23183/300 7891112173231 CONJ COLHER TRAMONTINA C/3 PCS LEME PTO INOX CX 12 3,00 86,41 259,23 0,00"
+  // Ex: "- 7891112003057 FACA TRAMONTINA UND CARNE/COZ 6 INX UNIVERSAL - REF: 22921/106 CX 12 2,00 136,47 272,94 0,00"
+  // ----------------------------------------------------
+  const hiperRegex = /^([0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8}|-)\s+((?:789|790)\d{10}|\d{13})\s+(.+?)\s+(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)\s*(\d+)?\s+(\d+(?:[,\.]\d+)?)\s+([\d\.,]+)\s+([\d\.,]+)/i;
+  const hiperMatch = hiperRegex.exec(cleanLine);
+  if (hiperMatch) {
+    const rawRef = hiperMatch[1];
+    const ean = hiperMatch[2];
+    const desc = hiperMatch[3];
+    const emb = parseInt(hiperMatch[5], 10) || 1;
+    const qtd = parseFloat(hiperMatch[6].replace(',', '.'));
+
+    let finalRef: string | undefined = rawRef !== '-' && isValidTramontinaSku(rawRef) ? normalizeTramontinaSku(rawRef) : undefined;
+    if (!finalRef) {
+      const refInDesc = /\b(?:REF:?|REF\.?:?)\s*([0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{8})\b/i.exec(desc);
+      if (refInDesc) {
+        finalRef = normalizeTramontinaSku(refInDesc[1]);
+      }
+    }
+
+    return {
+      isMatch: true,
+      skuRef: finalRef,
+      ean: ean,
+      quantidade: qtd,
+      embalagem: emb
+    };
+  }
+
+  // ----------------------------------------------------
   // Padrão Geral com Rótulos (Ex: "REF: 24011/008 EMB: 6 QTDE: 24 UN")
   // ----------------------------------------------------
   const labeledRegex = /(?:REF(?:ER[EÊ]NCIA)?|C[OÓ]D(?:IGO)?|SKU|MATERIAL)?[:\s#]*([0-9]{5}[\/\-\.][0-9]{3}|[0-9]{8})\b.*?(?:EMB(?:ALAGEM)?|CX|BOX)[:\s]*(\d+).*?(?:QTDE?|QUANT(?:IDADE)?|SOLIC)[:\s]*(\d+(?:[,\.]\d+)?)/i;
@@ -461,8 +683,8 @@ export function extractEanCodes(text: string): CodeMatch[] {
   const found: CodeMatch[] = [];
   const posSeen = new Set<number>();
 
-  // Prioridade 1: Código EAN brasileiro (começa com 789)
-  const eanBrRegex = /\b(789\d{10})\b/g;
+  // Prioridade 1: Código EAN brasileiro (começa com 789 ou 790)
+  const eanBrRegex = /\b((?:789|790)\d{10})\b/g;
   let m: RegExpExecArray | null;
   while ((m = eanBrRegex.exec(text)) !== null) {
     const startPos = m.index;
@@ -728,8 +950,8 @@ export function extractOrderOccurrences(text: string): Array<{ index: number; or
     });
   }
 
-  // Padrão 3: Consinco / TOTVS / Centerbox (ex: "PEDIDO DE COMPRAS 456789")
-  const consincoOrderRegex = /PEDIDO\s+DE\s+COMPRAS?\s*[:\s]+(\d{4,12})/gi;
+  // Padrão 3: Consinco / TOTVS / Centerbox / Hiper Atacado (ex: "PEDIDO DE COMPRAS - 520923 /M")
+  const consincoOrderRegex = /PEDIDO\s+DE\s+COMPRAS?\s*[-–—:\s]+\s*(\d{4,12})/gi;
   let conM: RegExpExecArray | null;
   while ((conM = consincoOrderRegex.exec(text)) !== null) {
     occurrences.push({ index: conM.index, orderNumber: conM[1] });
@@ -949,8 +1171,11 @@ export function extractSkusFromText(
   origem: OrigemType,
   separarLoja: boolean
 ): OrderItem[] {
+  // Reconstrói e une códigos de referência e EAN quebrados em linhas subsequentes
+  const normalizedText = rejoinBrokenCodes(text);
+
   // Identifica OCs / lojas / filiais e CNPJs para garantir a integridade dos dados
-  const segments = splitIntoStores(text);
+  const segments = splitIntoStores(normalizedText);
   const allItems: OrderItem[] = [];
 
   segments.forEach(seg => {

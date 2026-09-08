@@ -133,6 +133,20 @@ export const HelpModal: React.FC<HelpModalProps> = ({ isOpen, onClose }) => {
             </p>
           </div>
 
+          {/* Section 5 */}
+          <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-4">
+            <div className="flex items-center gap-2 font-bold text-slate-900 text-sm mb-2">
+              <CheckCircle2 className="w-4 h-4 text-blue-600" />
+              <span>5. Leitura de Códigos e EAN Quebrados em Linhas</span>
+            </div>
+            <p className="text-slate-600 leading-relaxed">
+              Em alguns relatórios de clientes com colunas estreitas (ex: Hiper Atacado, Consinco, TOTVS), o número de referência ou EAN pode quebrar para a linha de baixo (ex: <code className="bg-white px-1 py-0.5 rounded border font-mono text-[11px]">23183/30</code> na 1ª linha e <code className="bg-white px-1 py-0.5 rounded border font-mono text-[11px]">0</code> na linha seguinte, ou EAN <code className="bg-white px-1 py-0.5 rounded border font-mono text-[11px]">78911120172</code> na 1ª linha e <code className="bg-white px-1 py-0.5 rounded border font-mono text-[11px]">14</code> na linha seguinte).
+            </p>
+            <p className="text-slate-600 leading-relaxed pt-1.5">
+              O sistema detecta automaticamente quando há menos números do que os padrões oficiais (8 dígitos para referências Tramontina ou 13 dígitos para EANs) e junta de forma inteligente com os números da linha de baixo, recompondo o produto completo juntamente com embalagem (CX) e quantidade.
+            </p>
+          </div>
+
         </div>
 
         {/* Footer */}
