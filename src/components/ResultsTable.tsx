@@ -16,7 +16,7 @@ import {
   ChevronUp
 } from 'lucide-react';
 import { OrderItem, OrigemType } from '../types';
-import { rowsToTsv, downloadRowsAsCsv, safeFileName, ITEM_LIMIT } from '../utils/csvExporter';
+import { rowsToTsv, downloadRowsAsCsv, getStoreFileName, ITEM_LIMIT } from '../utils/csvExporter';
 import confetti from 'canvas-confetti';
 
 interface ResultsTableProps {
@@ -86,6 +86,9 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
     return filteredRows.filter(r => r.isValidSku).length;
   }, [filteredRows]);
 
+  const isMultiStore = storeGroups.length > 1;
+  const showSeparatedView = separarLoja || isMultiStore;
+
   const handleCopyClipboard = async () => {
     try {
       const tsv = rowsToTsv(filteredRows);
@@ -100,10 +103,18 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
 
   const handleDownloadAllCsv = () => {
     if (filteredRows.length === 0) return;
-    const stamp = new Date().toISOString().slice(0, 10);
-    const { totalFiles } = downloadRowsAsCsv(
+    
+    // Se possui mais de uma OC / loja separada, baixa cada uma com seu respectivo nome
+    if (storeGroups.length > 1) {
+      handleDownloadAllStoresSeparately();
+      return;
+    }
+
+    const singleStore = storeGroups[0];
+    const baseName = getStoreFileName(singleStore ? singleStore.loja : '', filteredRows, origem);
+    const { totalFiles, fileNames } = downloadRowsAsCsv(
       filteredRows,
-      `pedido_tramontina_${origem}_${stamp}`,
+      baseName,
       formatWithSlash
     );
 
@@ -115,43 +126,48 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
 
     if (totalFiles > 1) {
       onNotify(
-        `Pedido com ${filteredRows.length} itens: gerados ${totalFiles} arquivos .CSV (limite de ${ITEM_LIMIT} itens por arquivo para importação no ERP).`,
+        `Pedido com ${filteredRows.length} itens: gerados ${totalFiles} arquivos .CSV (${fileNames.join(', ')}).`,
         'ok'
       );
     } else {
-      onNotify(`Planilha .CSV gerada e baixada com sucesso (${filteredRows.length} itens)!`, 'ok');
+      onNotify(`Planilha "${fileNames[0]}" baixada com sucesso (${filteredRows.length} itens)!`, 'ok');
     }
   };
 
   const handleDownloadSingleStore = (lojaName: string, storeItems: OrderItem[]) => {
-    const stamp = new Date().toISOString().slice(0, 10);
-    const { totalFiles } = downloadRowsAsCsv(
+    const baseName = getStoreFileName(lojaName, storeItems, origem);
+    const { totalFiles, fileNames } = downloadRowsAsCsv(
       storeItems,
-      `pedido_${origem}_${safeFileName(lojaName)}_${stamp}`,
+      baseName,
       formatWithSlash
     );
 
     if (totalFiles > 1) {
       onNotify(
-        `Loja "${lojaName}" com ${storeItems.length} itens: gerados ${totalFiles} arquivos (limite de ${ITEM_LIMIT} itens por arquivo).`,
+        `OC / Loja "${lojaName}" com ${storeItems.length} itens: gerados ${totalFiles} arquivos (${fileNames.join(', ')}).`,
         'ok'
       );
     } else {
-      onNotify(`Arquivo .CSV da loja "${lojaName}" gerado com sucesso!`, 'ok');
+      onNotify(`Planilha "${fileNames[0]}" baixada com sucesso!`, 'ok');
     }
   };
 
   const handleDownloadAllStoresSeparately = () => {
-    const stamp = new Date().toISOString().slice(0, 10);
     let queueCount = 0;
+    let delay = 0;
+    const downloadedNames: string[] = [];
 
-    storeGroups.forEach((group, groupIdx) => {
+    storeGroups.forEach((group) => {
       const items = group.items;
-      const { totalFiles } = downloadRowsAsCsv(
+      const baseName = getStoreFileName(group.loja, items, origem);
+      const { totalFiles, fileNames } = downloadRowsAsCsv(
         items,
-        `pedido_${origem}_${safeFileName(group.loja)}_${stamp}`,
-        formatWithSlash
+        baseName,
+        formatWithSlash,
+        delay
       );
+      downloadedNames.push(...fileNames);
+      delay += totalFiles * 350;
       queueCount += totalFiles;
     });
 
@@ -161,7 +177,36 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
       // ignore
     }
 
-    onNotify(`Iniciando download de ${storeGroups.length} lojas (${queueCount} arquivos no total).`, 'ok');
+    onNotify(
+      `Baixando ${storeGroups.length} OC(s)/Loja(s) separadas (${queueCount} planilha(s) no total: ${downloadedNames.slice(0, 3).join(', ')}${downloadedNames.length > 3 ? '...' : ''}).`,
+      'ok'
+    );
+  };
+
+  const handleDownloadConsolidated = () => {
+    if (filteredRows.length === 0) return;
+    const stamp = new Date().toISOString().slice(0, 10);
+    const baseName = `pedido_consolidado_${origem}_${stamp}`;
+    const { totalFiles, fileNames } = downloadRowsAsCsv(
+      filteredRows,
+      baseName,
+      formatWithSlash
+    );
+
+    try {
+      confetti({ particleCount: 50, spread: 60, origin: { y: 0.8 } });
+    } catch {
+      // ignore
+    }
+
+    if (totalFiles > 1) {
+      onNotify(
+        `Pedido consolidado com ${filteredRows.length} itens: gerados ${totalFiles} arquivos (${fileNames.join(', ')}).`,
+        'ok'
+      );
+    } else {
+      onNotify(`Planilha consolidada "${fileNames[0]}" baixada com sucesso!`, 'ok');
+    }
   };
 
   const toggleStoreCollapse = (loja: string) => {
@@ -209,26 +254,41 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
               <span>{copied ? 'Copiado!' : 'Copiar Excel'}</span>
             </button>
 
-            {!separarLoja ? (
+            {!isMultiStore ? (
               <button
                 type="button"
                 id="downloadCsv"
                 onClick={handleDownloadAllCsv}
                 className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-bold rounded-lg bg-[#004B87] hover:bg-[#003B6D] text-white shadow-sm transition-all cursor-pointer active:scale-95"
+                title={`Baixar planilha: ${getStoreFileName(storeGroups[0]?.loja, filteredRows, origem)}.csv`}
               >
                 <Download className="w-3.5 h-3.5" />
                 <span>Baixar Planilha (.CSV)</span>
               </button>
             ) : (
-              <button
-                type="button"
-                id="downloadAllLojas"
-                onClick={handleDownloadAllStoresSeparately}
-                className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-bold rounded-lg bg-[#004B87] hover:bg-[#003B6D] text-white shadow-sm transition-all cursor-pointer active:scale-95"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Baixar Todas as OCs / Lojas ({storeGroups.length})</span>
-              </button>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  id="downloadAllLojas"
+                  onClick={handleDownloadAllStoresSeparately}
+                  className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-bold rounded-lg bg-[#004B87] hover:bg-[#003B6D] text-white shadow-sm transition-all cursor-pointer active:scale-95"
+                  title="Baixa uma planilha para cada OC ou Loja com o seu respectivo nome"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Baixar Todas as OCs / Lojas ({storeGroups.length})</span>
+                </button>
+
+                <button
+                  type="button"
+                  id="downloadConsolidated"
+                  onClick={handleDownloadConsolidated}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors cursor-pointer"
+                  title="Baixa todos os itens consolidados em um único arquivo CSV"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Consolidado (1 arquivo)</span>
+                </button>
+              </div>
             )}
           </div>
         )}
@@ -267,10 +327,10 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
               <span>Lojas / Filiais</span>
             </div>
             <div className="text-xl font-bold text-slate-900" id="metricFiles">
-              {separarLoja ? storeGroups.length : `${uniqueFiles} arquivo(s)`}
+              {isMultiStore ? `${storeGroups.length} OCs / Lojas` : `${uniqueFiles} arquivo(s)`}
             </div>
             <div className="text-[10px] text-slate-400">
-              {separarLoja ? 'Grupos de faturamento' : 'Arquivos processados'}
+              {isMultiStore ? 'Separadas por OC / Loja' : 'Arquivos processados'}
             </div>
           </div>
 
@@ -321,7 +381,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
               Suba o PDF da ordem de compra ou cole o texto no Passo 1 e clique em <strong>"Extrair Referências"</strong>.
             </p>
           </div>
-        ) : !separarLoja ? (
+        ) : !showSeparatedView ? (
           <div className="overflow-x-auto border border-slate-200 rounded-xl shadow-inner bg-white">
             <table className="w-full text-xs text-left border-collapse">
               <thead>
@@ -354,6 +414,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
           <div className="space-y-4">
             {storeGroups.map((group) => {
               const isCollapsed = !!collapsedStores[group.loja];
+              const storeFileName = getStoreFileName(group.loja, group.items, origem);
               return (
                 <div key={group.loja} className="border border-slate-200 rounded-xl overflow-hidden shadow-sm bg-white">
                   <div className="bg-slate-100/90 px-4 py-2.5 flex items-center justify-between border-b border-slate-200">
@@ -378,10 +439,11 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
                     <button
                       type="button"
                       onClick={() => handleDownloadSingleStore(group.loja, group.items)}
-                      className="loja-download inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold rounded-md bg-white hover:bg-blue-50 border border-slate-200 text-[#004B87] transition-colors cursor-pointer"
+                      className="loja-download inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-lg bg-white hover:bg-blue-50 border border-slate-200 text-[#004B87] transition-all cursor-pointer shadow-xs active:scale-95"
+                      title={`Baixar planilha: ${storeFileName}.csv`}
                     >
-                      <Download className="w-3 h-3" />
-                      <span>Baixar CSV desta loja</span>
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Baixar CSV: <strong className="font-mono">{storeFileName}.csv</strong></span>
                     </button>
                   </div>
 

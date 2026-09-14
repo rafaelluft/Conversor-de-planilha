@@ -133,19 +133,26 @@ export async function extractTextFromPdf(file: File): Promise<{ text: string; pa
 export function rejoinBrokenCodes(text: string): string {
   if (!text) return '';
 
-  const rawLines = text.split(/\r?\n/);
-  const lines = rawLines.map(l => l.trim()).filter(l => l.length > 0);
+  const rawLines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
 
   // PASSO 1: Junção Sequencial / Vertical (quando cada pedaço quebrado ficou em linhas sucessivas)
   const step1Lines: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    let curr = lines[i];
+  for (let i = 0; i < rawLines.length; i++) {
+    let curr = rawLines[i];
 
-    while (i + 1 < lines.length) {
-      const next = lines[i + 1];
+    while (i + 1 < rawLines.length) {
+      const next = rawLines[i + 1];
       let merged = false;
 
-      // 1.1 Linha termina com referência incompleta com barra (ex: "23183/30" ou "23183/")
+      // 1.1 Linha é apenas '-' e a próxima começa com EAN ou SKU
+      if (curr === '-' && /^(?:(?:789|790)\d+|\d{5}[\/\-\.]\d+|\d{7,8})/.test(next)) {
+        curr = `- ${next}`;
+        i++;
+        merged = true;
+        continue;
+      }
+
+      // 1.2 Linha termina com referência incompleta com barra (ex: "23183/30" ou "23183/")
       const slashMatch = /(?:^|\s)(\d{5}\/(?:\d{1,2})?)$/.exec(curr);
       if (slashMatch) {
         const rawRef = slashMatch[1];
@@ -156,7 +163,7 @@ export function rejoinBrokenCodes(text: string): string {
           const completedRef = rawRef + nextMatch[1];
           curr = curr.slice(0, curr.length - rawRef.length) + completedRef;
           if (nextMatch[2] && nextMatch[2].trim()) {
-            lines[i + 1] = nextMatch[2].trim();
+            rawLines[i + 1] = nextMatch[2].trim();
           } else {
             i++;
           }
@@ -165,14 +172,14 @@ export function rejoinBrokenCodes(text: string): string {
         }
       }
 
-      // 1.2 Linha termina com 5 dígitos numéricos e a próxima começa com "/300"
+      // 1.3 Linha termina com 5 dígitos numéricos e a próxima começa com "/300"
       const slashContMatch = /(?:^|\s)(\d{5})$/.exec(curr);
       if (slashContMatch) {
         const nextSlash = /^(\/\d{3})(?:\s+(.*)|$)/.exec(next);
         if (nextSlash) {
           curr = curr + nextSlash[1];
           if (nextSlash[2] && nextSlash[2].trim()) {
-            lines[i + 1] = nextSlash[2].trim();
+            rawLines[i + 1] = nextSlash[2].trim();
           } else {
             i++;
           }
@@ -181,26 +188,28 @@ export function rejoinBrokenCodes(text: string): string {
         }
       }
 
-      // 1.3 Linha termina com EAN incompleto (ex: "78911120172" com 11 dígitos, precisa de 2)
-      const eanMatch = /(?:^|\s)((?:789|790)\d{7,11}|\d{10,12})$/.exec(curr);
+      // 1.4 Linha termina com EAN incompleto (ex: "78911120172" com 11 dígitos, precisa de 2)
+      const eanMatch = /(?:^|\s)((?:789|790)\d{4,9}|\d{7,12})$/.exec(curr);
       if (eanMatch) {
         const rawEan = eanMatch[1];
         const needed = 13 - rawEan.length;
-        const nextMatch = new RegExp('^(\\d{' + needed + '})(?:\\s+(.*)|$)').exec(next);
-        if (nextMatch) {
-          const completedEan = rawEan + nextMatch[1];
-          curr = curr.slice(0, curr.length - rawEan.length) + completedEan;
-          if (nextMatch[2] && nextMatch[2].trim()) {
-            lines[i + 1] = nextMatch[2].trim();
-          } else {
-            i++;
+        if (needed >= 1 && needed <= 6) {
+          const nextMatch = new RegExp('^(\\d{' + needed + '})(?:\\s+(.*)|$)').exec(next);
+          if (nextMatch) {
+            const completedEan = rawEan + nextMatch[1];
+            curr = curr.slice(0, curr.length - rawEan.length) + completedEan;
+            if (nextMatch[2] && nextMatch[2].trim()) {
+              rawLines[i + 1] = nextMatch[2].trim();
+            } else {
+              i++;
+            }
+            merged = true;
+            continue;
           }
-          merged = true;
-          continue;
         }
       }
 
-      // 1.4 Unidade de medida isolada (ex: "CX") seguida de número de embalagem (ex: "12")
+      // 1.5 Unidade de medida isolada (ex: "CX") seguida de número de embalagem (ex: "12")
       if (/^(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)$/i.test(curr) && /^\d+$/.test(next)) {
         curr = `${curr} ${next}`;
         i++;
@@ -208,7 +217,7 @@ export function rejoinBrokenCodes(text: string): string {
         continue;
       }
 
-      // 1.5 Decimal de quantidade isolado (ex: "3,0" seguido de "0" -> "3,00")
+      // 1.6 Decimal de quantidade isolado (ex: "3,0" seguido de "0" -> "3,00")
       if (/^\d+,\d*$/.test(curr) && /^\d+$/.test(next)) {
         curr = `${curr}${next}`;
         i++;
@@ -223,11 +232,10 @@ export function rejoinBrokenCodes(text: string): string {
   }
 
   // PASSO 2: Junção Tabular Multilinha (quando uma linha de tabela quebrou em Linha A e Linha B de continuação)
-  const finalLines: string[] = [];
+  const step2Lines: string[] = [];
   for (let i = 0; i < step1Lines.length; i++) {
     let curr = step1Lines[i];
 
-    // Verifica se a linha atual contém uma ref quebrada ou um EAN quebrado
     const brokenSlashRef = /\b(\d{5}\/(?:\d{1,2})?)\b/.exec(curr);
     const brokenEan = /\b((?:789|790)\d{7,11}|\d{10,12})\b/.exec(curr);
 
@@ -237,12 +245,10 @@ export function rejoinBrokenCodes(text: string): string {
       let tIdx = 0;
       let handled = false;
 
-      // Se a ref na linha atual é '-' ou um traço, pula traço inicial da próxima linha se houver
       if (nextTokens[tIdx] === '-') {
         tIdx++;
       }
 
-      // Se a ref estava quebrada com barra (ex: "23183/30" precisa de 1 dígito)
       if (brokenSlashRef) {
         const rawRef = brokenSlashRef[1];
         const slashPos = rawRef.indexOf('/');
@@ -254,7 +260,6 @@ export function rejoinBrokenCodes(text: string): string {
         }
       }
 
-      // Se o EAN estava quebrado (ex: 11 dígitos precisa de 2)
       if (brokenEan) {
         if (nextTokens[tIdx] === '-') tIdx++;
         const rawEan = brokenEan[1];
@@ -279,14 +284,12 @@ export function rejoinBrokenCodes(text: string): string {
           extraEmb = remaining.pop()!;
         }
 
-        // Se encontrou número de embalagem e/ou decimal da quantidade
         if (extraEmb) {
           curr = curr.replace(/\b(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)\b\s*(\d+,\d*)/i, `$1 ${extraEmb} $2${extraQtdDec || ''}`);
         } else if (extraQtdDec) {
           curr = curr.replace(/\b(\d+,\d*)\b(?=\s+\d+,\d+)/, `$1${extraQtdDec}`);
         }
 
-        // Se restou texto da descrição (ex: 'INOX' ou 'UNIVERSAL - REF: 22921/106')
         if (remaining.length > 0) {
           const filtered = remaining.filter(w => !new RegExp('\\b' + w + '\\b', 'i').test(curr));
           if (filtered.length > 0) {
@@ -299,11 +302,53 @@ export function rejoinBrokenCodes(text: string): string {
           }
         }
 
-        i++; // Linha seguinte consumida com sucesso
+        i++;
       }
     }
 
-    finalLines.push(curr);
+    step2Lines.push(curr);
+  }
+
+  // PASSO 3: Reconstrução de Linhas de Produto Fragmentadas em Múltiplas Linhas
+  // (Ex: Cód Forn / EAN na linha 1, Descrição/Unidade na linha 2, Embalagem/Qtd nas linhas seguintes, Preço no final)
+  const finalLines: string[] = [];
+  for (let i = 0; i < step2Lines.length; i++) {
+    let curr = step2Lines[i];
+
+    // Se a linha atual é apenas uma referência Tramontina isolada (ex: "23183/300") e a próxima começa com EAN
+    if (i + 1 < step2Lines.length && /^(?:[0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8}|-)$/.test(curr)) {
+      const nextLine = step2Lines[i + 1];
+      if (/^((?:789|790)\d{10}|\d{13})\b/.test(nextLine)) {
+        curr = `${curr} ${nextLine}`;
+        i++;
+      }
+    }
+
+    const isStart = /^(?:[0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8}|-)\s+((?:789|790)\d{10}|\d{13})\b/.test(curr) ||
+                    /^((?:789|790)\d{10}|\d{13})\b/.test(curr);
+    const hasEnd = /\d+[\.,]\d{2}\s+[\d\.,]+\s+[\d\.,]+$/.test(curr);
+
+    if (isStart && !hasEnd) {
+      let j = i + 1;
+      const parts = [curr];
+      while (j < step2Lines.length && (j - i) <= 10) {
+        const nLine = step2Lines[j];
+        parts.push(nLine);
+        if (/\d+[\.,]\d{2}\s+[\d\.,]+\s+[\d\.,]+$/.test(nLine)) {
+          j++;
+          break;
+        }
+        if (/^(?:[0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8}|-)\s+((?:789|790)\d{10}|\d{13})\b/.test(nLine) ||
+            /^((?:789|790)\d{10}|\d{13})\b/.test(nLine)) {
+          break;
+        }
+        j++;
+      }
+      finalLines.push(parts.join(' ').replace(/\s+/g, ' '));
+      i = j - 1;
+    } else {
+      finalLines.push(curr);
+    }
   }
 
   return finalLines.join('\n');
@@ -536,7 +581,7 @@ export function parseTabularLine(line: string): {
   // Ex: "23183/300 7891112173231 CONJ COLHER TRAMONTINA C/3 PCS LEME PTO INOX CX 12 3,00 86,41 259,23 0,00"
   // Ex: "- 7891112003057 FACA TRAMONTINA UND CARNE/COZ 6 INX UNIVERSAL - REF: 22921/106 CX 12 2,00 136,47 272,94 0,00"
   // ----------------------------------------------------
-  const hiperRegex = /^([0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8}|-)\s+((?:789|790)\d{10}|\d{13})\s+(.+?)\s+(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)\s*(\d+)?\s+(\d+(?:[,\.]\d+)?)\s+([\d\.,]+)\s+([\d\.,]+)/i;
+  const hiperRegex = /^(?:([0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8}|-)\s+)?((?:789|790)\d{10}|\d{13})\s+(.+?)\s+(CX|UN|JG|CJ|PC|PÇ|CT|FD|PCT)\s*(\d+)?\s+(\d+(?:[,\.]\d+)?)\s+([\d\.,]+)\s+([\d\.,]+)/i;
   const hiperMatch = hiperRegex.exec(cleanLine);
   if (hiperMatch) {
     const rawRef = hiperMatch[1];
@@ -545,7 +590,7 @@ export function parseTabularLine(line: string): {
     const emb = parseInt(hiperMatch[5], 10) || 1;
     const qtd = parseFloat(hiperMatch[6].replace(',', '.'));
 
-    let finalRef: string | undefined = rawRef !== '-' && isValidTramontinaSku(rawRef) ? normalizeTramontinaSku(rawRef) : undefined;
+    let finalRef: string | undefined = rawRef && rawRef !== '-' && isValidTramontinaSku(rawRef) ? normalizeTramontinaSku(rawRef) : undefined;
     if (!finalRef) {
       const refInDesc = /\b(?:REF:?|REF\.?:?)\s*([0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{8})\b/i.exec(desc);
       if (refInDesc) {
@@ -802,48 +847,98 @@ export function attachPackagingAndQuantity(
     }
     const candidates: Candidate[] = [];
 
+    function isValidCandidateQty(qty: number): boolean {
+      if (isNaN(qty) || qty <= 0) return false;
+      if (qty >= 100000) return false;
+      const s = Math.round(qty).toString();
+      if (/^(?:789|790)\d+/.test(s)) return false;
+      if (s.length >= 7) return false;
+      return true;
+    }
+
+    function isValidCandidateEmb(emb: number): boolean {
+      if (isNaN(emb) || emb <= 0) return false;
+      if (emb > 2000) return false;
+      const s = Math.round(emb).toString();
+      if (/^(?:789|790)\d+/.test(s)) return false;
+      if (s.length >= 5) return false;
+      return true;
+    }
+
     findAllMatches(win, boxQtyFirst).forEach(m => {
-      candidates.push({
-        pos: m.index,
-        len: m[0].length,
-        data: { quantidade: parseFloat(m[1].replace(',', '.')), embalagem: parseInt(m[2], 10) || 1 }
-      });
+      const q = parseFloat(m[1].replace(',', '.'));
+      const e = parseInt(m[2], 10) || 1;
+      if (isValidCandidateQty(q) && isValidCandidateEmb(e)) {
+        candidates.push({
+          pos: m.index,
+          len: m[0].length,
+          data: { quantidade: q, embalagem: e }
+        });
+      }
     });
 
     findAllMatches(win, boxLabelFirst).forEach(m => {
-      candidates.push({
-        pos: m.index,
-        len: m[0].length,
-        data: { embalagem: parseInt(m[1], 10) || 1, quantidade: parseFloat(m[2].replace(',', '.')) }
-      });
+      const e = parseInt(m[1], 10) || 1;
+      const q = parseFloat(m[2].replace(',', '.'));
+      if (isValidCandidateQty(q) && isValidCandidateEmb(e)) {
+        candidates.push({
+          pos: m.index,
+          len: m[0].length,
+          data: { embalagem: e, quantidade: q }
+        });
+      }
     });
 
     const beforeMatches = findAllMatches(win, unitQtyBefore);
     beforeMatches.forEach(m => {
-      const numOffset = m[0].indexOf(m[1]);
-      const actualPos = m.index + (numOffset >= 0 ? numOffset : 0);
-      const actualLen = m[0].length - (numOffset >= 0 ? numOffset : 0);
-      candidates.push({
-        pos: actualPos,
-        len: actualLen,
-        data: { embalagem: 1, quantidade: parseFloat(m[1].replace(',', '.')) }
-      });
+      const q = parseFloat(m[1].replace(',', '.'));
+      if (isValidCandidateQty(q)) {
+        const numOffset = m[0].indexOf(m[1]);
+        const actualPos = m.index + (numOffset >= 0 ? numOffset : 0);
+        const actualLen = m[0].length - (numOffset >= 0 ? numOffset : 0);
+        candidates.push({
+          pos: actualPos,
+          len: actualLen,
+          data: { embalagem: 1, quantidade: q }
+        });
+      }
     });
 
     findAllMatches(win, unitQty).forEach(m => {
       const overlaps = beforeMatches.some(b => m.index >= b.index && m.index < b.index + b[0].length);
       if (!overlaps) {
-        candidates.push({
-          pos: m.index,
-          len: m[0].length,
-          data: { embalagem: 1, quantidade: parseFloat(m[1].replace(',', '.')) }
-        });
+        const q = parseFloat(m[1].replace(',', '.'));
+        if (isValidCandidateQty(q)) {
+          candidates.push({
+            pos: m.index,
+            len: m[0].length,
+            data: { embalagem: 1, quantidade: q }
+          });
+        }
       }
     });
 
     if (candidates.length === 0) return null;
     candidates.sort((a, b) => (preferLast ? b.pos - a.pos : a.pos - b.pos));
     return candidates[0];
+  }
+
+  function isValidParsedQty(qty: number): boolean {
+    if (isNaN(qty) || qty <= 0) return false;
+    if (qty >= 100000) return false;
+    const s = Math.round(qty).toString();
+    if (/^(?:789|790)\d+/.test(s)) return false;
+    if (s.length >= 7) return false;
+    return true;
+  }
+
+  function isValidParsedEmb(emb: number): boolean {
+    if (isNaN(emb) || emb <= 0) return false;
+    if (emb > 2000) return false;
+    const s = Math.round(emb).toString();
+    if (/^(?:789|790)\d+/.test(s)) return false;
+    if (s.length >= 5) return false;
+    return true;
   }
 
   return matches.map((match, i) => {
@@ -855,12 +950,16 @@ export function attachPackagingAndQuantity(
     // Formato FerreiraCosta / MDC (ex: 360 UN-1-UN)
     const landmark = packLandmark.exec(windowBefore) || packLandmark.exec(windowAfter);
     if (landmark) {
-      return {
-        sku: match.code,
-        quantidade: parseFloat(landmark[1].replace(',', '.')),
-        embalagem: parseInt(landmark[3], 10) || 1,
-        detectedType: match.type
-      };
+      const lQty = parseFloat(landmark[1].replace(',', '.'));
+      const lEmb = parseInt(landmark[3], 10) || 1;
+      if (isValidParsedQty(lQty) && isValidParsedEmb(lEmb)) {
+        return {
+          sku: match.code,
+          quantidade: lQty,
+          embalagem: lEmb,
+          detectedType: match.type
+        };
+      }
     }
 
     const afterRes = scanWindow(windowAfter, false);
@@ -888,11 +987,20 @@ export function attachPackagingAndQuantity(
 
     const embMatch = embOnlyRegex.exec(windowAfter) || embOnlyRegex.exec(windowBefore);
     const qtdMatch = qtdOnlyRegex.exec(windowAfter) || qtdOnlyRegex.exec(windowBefore);
-    const qtdRaw = qtdMatch ? qtdMatch[1] : null;
+    let embVal = 1;
+    if (embMatch) {
+      const parsedEmb = parseInt(embMatch[1], 10);
+      if (isValidParsedEmb(parsedEmb)) embVal = parsedEmb;
+    }
+    let qtdRaw: string | null = null;
+    if (qtdMatch) {
+      const parsedQtd = parseFloat(qtdMatch[1].replace(',', '.'));
+      if (isValidParsedQty(parsedQtd)) qtdRaw = qtdMatch[1];
+    }
 
     return {
       sku: match.code,
-      embalagem: embMatch ? parseInt(embMatch[1], 10) || 1 : 1,
+      embalagem: embVal,
       quantidade: qtdRaw ? parseFloat(qtdRaw.replace(',', '.')) : 1,
       detectedType: match.type
     };
@@ -1182,7 +1290,7 @@ export function extractSkusFromText(
     const lines = seg.text.split(/[\r\n]+/);
     const storeItems: OrderItem[] = [];
     const processedLineIndices = new Set<number>();
-    const effectiveLabel = (separarLoja || segments.length > 1) ? seg.label : 'Loja Principal';
+    const effectiveLabel = (separarLoja || segments.length > 1 || seg.label !== 'Loja Principal') ? seg.label : 'Loja Principal';
 
     // 1º Passo: Executa o parser estruturado linha por linha
     lines.forEach((line, lineIdx) => {
