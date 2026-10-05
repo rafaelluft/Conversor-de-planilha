@@ -40,6 +40,28 @@ export function isValidTramontinaSku(sku: string): boolean {
 }
 
 /**
+ * Converte string numérica no padrão brasileiro ou padrão internacional para number
+ * Trata: "60,00" -> 60, "1.250,50" -> 1250.50, "12,080000" -> 12.08, "12" -> 12
+ */
+export function parsePtBrNumber(val: string): number {
+  if (!val) return 0;
+  const clean = val.trim();
+  if (clean.includes('.') && clean.includes(',')) {
+    return parseFloat(clean.replace(/\./g, '').replace(',', '.'));
+  }
+  if (clean.includes(',')) {
+    return parseFloat(clean.replace(',', '.'));
+  }
+  if ((clean.match(/\./g) || []).length > 1) {
+    return parseFloat(clean.replace(/\./g, ''));
+  }
+  if (/^\d{1,3}\.\d{3}$/.test(clean)) {
+    return parseFloat(clean.replace('.', ''));
+  }
+  return parseFloat(clean);
+}
+
+/**
  * Extrai texto do PDF com fallback robusto:
  * 1. Primeiro tenta com agrupamento geométrico por linhas (X, Y)
  * 2. Se falhar ou vier vazio, faz concatenação direta sequencial de todos os itens de texto
@@ -376,6 +398,120 @@ export function parseTabularLine(line: string): {
   if (!cleanLine) return null;
 
   // ----------------------------------------------------
+  // MODELO 0A: Supermercados / Atacados / Altiplano
+  // Estrutura: [Item / Código / Descrição] <Quantidade> <Qtd. Emb> <Unidade> <Preço Unitário> [Total...]
+  // Coluna 4 = Quantidade (ex: 60,00 ou 12)
+  // Coluna 5 = Qtd. Emb (ex: 12 ou 6)
+  // Coluna 6 = Unidade (UN, CX, CJ, JG, PC, CT, etc.)
+  // Coluna 7 = Preço Unitário (ex: 10,4000 ou 24,70)
+  // Ex: "1 22902/105 FACA PEIXEIRA INOX 5 60,00 12 UN 10,4000 7,80 624,00"
+  // Ex: "2 20260724 FRIGIDEIRA 24CM TURIM 24,00 6 UN 24,7000 592,80"
+  // Ex: "3 7891112003019 FACA CARNE 8 120,00 24 UN 15,9000 1908,00"
+  // Ex: "0004 000123 23180/004 FACA CHURRASCO LEME 360,00 60 CX 1,8500 0,00 666,00"
+  // ----------------------------------------------------
+  const altiplanoRegex = /^(.+?)\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)\s*[\-\/]?\s*(UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)(?:\s+[\d\.,]+)*$/i;
+  const altiplanoUnitFirstRegex = /^(.+?)\s+(\d+(?:[\.,]\d+)?)\s*[\-\/]?\s*(UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)(?:\s+[\d\.,]+)*$/i;
+
+  const altiplanoMatch = altiplanoRegex.exec(cleanLine);
+  const altiplanoUnitFirstMatch = !altiplanoMatch ? altiplanoUnitFirstRegex.exec(cleanLine) : null;
+  const anyAltiplanoMatch = altiplanoMatch || altiplanoUnitFirstMatch;
+  if (anyAltiplanoMatch) {
+    const isUnitFirst = Boolean(altiplanoUnitFirstMatch);
+    const prefix = anyAltiplanoMatch[1].trim();
+    const qtdRaw = anyAltiplanoMatch[2];
+    const embRaw = isUnitFirst ? anyAltiplanoMatch[4] : anyAltiplanoMatch[3];
+
+    const qtd = parsePtBrNumber(qtdRaw);
+    const emb = Math.round(parsePtBrNumber(embRaw)) || 1;
+
+    let skuRef: string | undefined;
+    let ean: string | undefined;
+
+    // 1. EAN-13 no prefixo
+    const eanMatch = /\b((?:789|790)\d{10}|\d{13})\b/.exec(prefix);
+    if (eanMatch) {
+      ean = eanMatch[1];
+    }
+
+    // 2. Referência Tramontina com separador explícito (ex: 22902/105, 20260-724, 23799.063)
+    const formattedRef = /\b([0-9]{5})[\/\-\.]([0-9]{2,3})\b/.exec(prefix);
+    if (formattedRef) {
+      skuRef = normalizeTramontinaSku(`${formattedRef[1]}/${formattedRef[2]}`);
+    } else {
+      // 3. Referência com rótulo explícito (ex: REF: 22902/105)
+      const labeledRef = /(?:REF(?:ER[EÊ]NCIA)?|C[OÓ]D(?:IGO)?|MATERIAL|SKU|PROD(?:UTO)?|ITEM|TRAMONTINA)[:\.\s#]*([0-9]{5})[\/\-\.\s]?([0-9]{2,3})\b/i.exec(prefix);
+      if (labeledRef) {
+        skuRef = normalizeTramontinaSku(`${labeledRef[1]}/${labeledRef[2]}`);
+      } else {
+        // 4. Código contínuo de 8 dígitos válido como SKU Tramontina
+        const all8 = prefix.match(/\b([0-9]{5})([0-9]{3})\b/g);
+        if (all8) {
+          const found = all8.find(c => isValidTramontinaSku(c));
+          if (found) {
+            skuRef = normalizeTramontinaSku(found);
+          }
+        }
+      }
+    }
+
+    if (skuRef || ean) {
+      return {
+        isMatch: true,
+        skuRef,
+        ean,
+        quantidade: qtd,
+        embalagem: emb
+      };
+    }
+  }
+
+  // MODELO 0A (Variação sem unidade com validação matemática Qtd * Preço ≈ Total):
+  // Ex: "1 22902/105 FACA PEIXEIRA INOX 5 60,00 12 10,4000 624,00"
+  const math4NumsRegex = /^(.+?)\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)$/;
+  const math4Match = math4NumsRegex.exec(cleanLine);
+  if (math4Match) {
+    const n1 = parsePtBrNumber(math4Match[2]);
+    const n2 = parsePtBrNumber(math4Match[3]);
+    const n3 = parsePtBrNumber(math4Match[4]);
+    const n4 = parsePtBrNumber(math4Match[5]);
+
+    if (n1 > 0 && n2 > 0 && n3 > 0 && Math.abs(n1 * n3 - n4) <= Math.max(0.2, n4 * 0.02)) {
+      const prefix = math4Match[1].trim();
+      let skuRef: string | undefined;
+      let ean: string | undefined;
+
+      const eanMatch = /\b((?:789|790)\d{10}|\d{13})\b/.exec(prefix);
+      if (eanMatch) ean = eanMatch[1];
+
+      const formattedRef = /\b([0-9]{5})[\/\-\.]([0-9]{2,3})\b/.exec(prefix);
+      if (formattedRef) {
+        skuRef = normalizeTramontinaSku(`${formattedRef[1]}/${formattedRef[2]}`);
+      } else {
+        const labeledRef = /(?:REF(?:ER[EÊ]NCIA)?|C[OÓ]D(?:IGO)?|MATERIAL|SKU|PROD(?:UTO)?|ITEM|TRAMONTINA)[:\.\s#]*([0-9]{5})[\/\-\.\s]?([0-9]{2,3})\b/i.exec(prefix);
+        if (labeledRef) {
+          skuRef = normalizeTramontinaSku(`${labeledRef[1]}/${labeledRef[2]}`);
+        } else {
+          const all8 = prefix.match(/\b([0-9]{5})([0-9]{3})\b/g);
+          if (all8) {
+            const found = all8.find(c => isValidTramontinaSku(c));
+            if (found) skuRef = normalizeTramontinaSku(found);
+          }
+        }
+      }
+
+      if (skuRef || ean) {
+        return {
+          isMatch: true,
+          skuRef,
+          ean,
+          quantidade: n1,
+          embalagem: Math.round(n2) || 1
+        };
+      }
+    }
+  }
+
+  // ----------------------------------------------------
   // MODELO 0: Rotina 210 / WinThor / TOTVS Distribuição (Emitir Pedido de Compra)
   // Ex: "84882 COLHER MESA C/12PCS LEME AZ 23183990 1X1 CJ 80,00 19,951000 0,00 19,951000 0,00 6,50..."
   // Ex: "113021 FAQUEIRO 24PCS NEW KOLOR 23198/093 PRETO 23198/093 1X1 UN 60,00 30,286800..."
@@ -694,6 +830,11 @@ export function extractReferenceCodes(text: string): CodeMatch[] {
     if (/\b(CEP|CNPJ|CPF|INSCRI[CÇ][AÃ]O|FONE|FAX|TELEFONE|TEL|0800)\b/i.test(context)) {
       continue;
     }
+    // Evita se precedido por Pedido / OC / Nota Fiscal (ex: PEDIDO 16018001, ORDEM DE COMPRA 16018001)
+    const prefixBefore = text.slice(Math.max(0, startPos - 30), startPos);
+    if (/\b(?:PEDIDO(?:\s+DE\s+COMPRAS?)?|ORDEM\s+DE\s+COMPRA|O\.?C\.?|XPED|NF|NOTA\s+FISCAL)\s*[:#Nºn°\.\s-]*$/i.test(prefixBefore)) {
+      continue;
+    }
     // Evita se for parte de um número maior (ex: 13 dígitos EAN ou 14 dígitos CNPJ)
     const surroundingDigits = text.slice(Math.max(0, startPos - 2), Math.min(text.length, startPos + 10));
     if (/\d{9,}/.test(surroundingDigits)) {
@@ -865,6 +1006,36 @@ export function attachPackagingAndQuantity(
       return true;
     }
 
+    // Padrão Altiplano / Supermercado no texto livre: <Quantidade> <Qtd. Emb> <Unidade> <Preço Unitário>
+    // Ex: "60,00 12 UN 10,4000"
+    const qtyEmbUnitSeq = /(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)\s*[\-\/]?\s*(?:UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)/gi;
+    let seqM: RegExpExecArray | null;
+    while ((seqM = qtyEmbUnitSeq.exec(win)) !== null) {
+      const q = parsePtBrNumber(seqM[1]);
+      const e = Math.round(parsePtBrNumber(seqM[2])) || 1;
+      if (isValidCandidateQty(q) && isValidCandidateEmb(e)) {
+        candidates.push({
+          pos: seqM.index,
+          len: seqM[0].length,
+          data: { quantidade: q, embalagem: e }
+        });
+      }
+    }
+
+    // Padrão com unidade antes de Qtd. Emb: <Quantidade> <Unidade> <Qtd. Emb> <Preço Unitário>
+    const qtyUnitEmbSeq = /(\d+(?:[\.,]\d+)?)\s*[\-\/]?\s*(?:UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)/gi;
+    while ((seqM = qtyUnitEmbSeq.exec(win)) !== null) {
+      const q = parsePtBrNumber(seqM[1]);
+      const e = Math.round(parsePtBrNumber(seqM[2])) || 1;
+      if (isValidCandidateQty(q) && isValidCandidateEmb(e)) {
+        candidates.push({
+          pos: seqM.index,
+          len: seqM[0].length,
+          data: { quantidade: q, embalagem: e }
+        });
+      }
+    }
+
     findAllMatches(win, boxQtyFirst).forEach(m => {
       const q = parseFloat(m[1].replace(',', '.'));
       const e = parseInt(m[2], 10) || 1;
@@ -891,6 +1062,11 @@ export function attachPackagingAndQuantity(
 
     const beforeMatches = findAllMatches(win, unitQtyBefore);
     beforeMatches.forEach(m => {
+      // Evita se for precedido por outra quantidade (ex: "60,00 12 UN" -> 12 é embalagem, não quantidade!)
+      const preText = win.slice(Math.max(0, m.index - 30), m.index);
+      if (/\d+(?:[\.,]\d+)?\s+$/.test(preText)) {
+        return;
+      }
       const q = parseFloat(m[1].replace(',', '.'));
       if (isValidCandidateQty(q)) {
         const numOffset = m[0].indexOf(m[1]);
@@ -905,6 +1081,11 @@ export function attachPackagingAndQuantity(
     });
 
     findAllMatches(win, unitQty).forEach(m => {
+      // Evita se for precedido por duas quantidades (ex: "60,00 12 UN 10,4000" -> 10,4000 é Preço Unitário!)
+      const preText = win.slice(Math.max(0, m.index - 30), m.index);
+      if (/\d+(?:[\.,]\d+)?\s+\d+(?:[\.,]\d+)?\s*[\-\/]?\s*$/.test(preText)) {
+        return;
+      }
       const overlaps = beforeMatches.some(b => m.index >= b.index && m.index < b.index + b[0].length);
       if (!overlaps) {
         const q = parseFloat(m[1].replace(',', '.'));
@@ -1058,8 +1239,8 @@ export function extractOrderOccurrences(text: string): Array<{ index: number; or
     });
   }
 
-  // Padrão 3: Consinco / TOTVS / Centerbox / Hiper Atacado (ex: "PEDIDO DE COMPRAS - 520923 /M")
-  const consincoOrderRegex = /PEDIDO\s+DE\s+COMPRAS?\s*[-–—:\s]+\s*(\d{4,12})/gi;
+  // Padrão 3: Pedido / Pedido de Compra / Consinco / TOTVS (ex: "PEDIDO 16018001", "PEDIDO DE COMPRA 16018001", "PEDIDO DE COMPRAS - 520923 /M")
+  const consincoOrderRegex = /PEDIDO(?:\s+DE\s+COMPRAS?)?\s*[-–—:#Nºn°\.\s]+\s*(\d{4,12})/gi;
   let conM: RegExpExecArray | null;
   while ((conM = consincoOrderRegex.exec(text)) !== null) {
     occurrences.push({ index: conM.index, orderNumber: conM[1] });
