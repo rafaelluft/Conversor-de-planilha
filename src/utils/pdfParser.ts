@@ -512,6 +512,44 @@ export function parseTabularLine(line: string): {
   }
 
   // ----------------------------------------------------
+  // MODELO 0B: Rotina 211 - Consultar Pedido de Compra / Simplificado 1 (ACM Distribuidora / Grupo Pajeú / WinThor)
+  // Estrutura: <Prd.> [<R103>] <Descrição> <Embalagem> <Unid.> <Cód. Fab.> <Qtde> <IPI> <Preço Líquido> <Pr.Mercadoria> <Vlr. Total>
+  // Ex: "92553 2 ABRIDOR TRAMONTINA SACA ROLHA/CANIV PT 1UN UN 26330/100 12,000 0,000000 34,659200 34,659200 415,9104"
+  // Ex: "91033 BULE TERM TRAMONTINA EXATA 1L BG 1UN UN 61636/108 12,000 0,000000 44,450000 44,450000 533,4"
+  // Ex: "90981 PORTA FRIOS TRAMONTINA MIXCOLOR CZ 1,3L 1UN UN 25469030 12,000 0,000000 27,480000 27,480000 329,76"
+  // Ex: "91031 1 BULE TERM TRAMONTINA EXATA 1L VM 1UN UN 61636-106 12,000 0,000000 44,450000 44,450000 533,4"
+  // Coluna 6 (Qtde) = Quantidade em peças (ex: 12,000)
+  // ----------------------------------------------------
+  const r211Regex = /^(\d{4,8})\s+(?:\d{1,4}\s+)?(.+?)\s+(\d*[\w\.]+)\s+(UN|UND|UNID(?:ADE)?|PC|PÇ|P[CÇ]A|CJ|CJO|JG|JGO|CX|CXA|FD|PCT|KIT)\.?\b\s+([0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8})\s+(\d+(?:[\.,]\d+)?)(?:\s+[\d\.,]+)*$/i;
+  const r211Match = r211Regex.exec(cleanLine);
+  if (r211Match) {
+    const rawDesc = r211Match[2].trim();
+    const embRaw = r211Match[3].trim();
+    const rawRef = r211Match[5].trim();
+    const qtdRaw = r211Match[6].trim();
+
+    const qtd = parsePtBrNumber(qtdRaw);
+    const embNum = parseInt(embRaw.replace(/\D/g, ''), 10) || 1;
+
+    let skuRef = normalizeTramontinaSku(rawRef);
+    if (!isValidTramontinaSku(skuRef) && !/^\d{5}\/\d{2,3}$/.test(skuRef)) {
+      const refInDesc = /\b([0-9]{5})[\/\-\.]([0-9]{2,3})\b/.exec(rawDesc);
+      if (refInDesc) {
+        skuRef = normalizeTramontinaSku(`${refInDesc[1]}/${refInDesc[2]}`);
+      }
+    }
+
+    if (qtd > 0) {
+      return {
+        isMatch: true,
+        skuRef,
+        quantidade: qtd,
+        embalagem: embNum
+      };
+    }
+  }
+
+  // ----------------------------------------------------
   // MODELO 0: Rotina 210 / WinThor / TOTVS Distribuição (Emitir Pedido de Compra)
   // Ex: "84882 COLHER MESA C/12PCS LEME AZ 23183990 1X1 CJ 80,00 19,951000 0,00 19,951000 0,00 6,50..."
   // Ex: "113021 FAQUEIRO 24PCS NEW KOLOR 23198/093 PRETO 23198/093 1X1 UN 60,00 30,286800..."
@@ -1239,6 +1277,24 @@ export function extractOrderOccurrences(text: string): Array<{ index: number; or
     });
   }
 
+  // Padrão 2B: Rotina 211 / WinThor (ex: "NUMPED 14569 DTVENC" ou "NUMPED: 14569")
+  const numpedRegex = /\bNUMPED\s*[:\s]+(\d{4,12})/gi;
+  let npM: RegExpExecArray | null;
+  while ((npM = numpedRegex.exec(text)) !== null) {
+    occurrences.push({ index: npM.index, orderNumber: npM[1] });
+  }
+
+  // Padrão 2C: Tabela com Filial e Nº Pedido (ex: "Filial Nº Pedido ... \n62 14569 Entrada Normal")
+  const filialPedRegex = /Filial\s+N[ºo°]\s*Pedido[\s\S]{1,120}?\n\s*(\d{1,4})\s+(\d{4,12})/gi;
+  let fpM: RegExpExecArray | null;
+  while ((fpM = filialPedRegex.exec(text)) !== null) {
+    occurrences.push({
+      index: fpM.index,
+      orderNumber: fpM[2],
+      filial: fpM[1]
+    });
+  }
+
   // Padrão 3: Pedido / Pedido de Compra / Consinco / TOTVS (ex: "PEDIDO 16018001", "PEDIDO DE COMPRA 16018001", "PEDIDO DE COMPRAS - 520923 /M")
   const consincoOrderRegex = /PEDIDO(?:\s+DE\s+COMPRAS?)?\s*[-–—:#Nºn°\.\s]+\s*(\d{4,12})/gi;
   let conM: RegExpExecArray | null;
@@ -1268,7 +1324,12 @@ export function splitIntoStores(text: string): StoreSegment[] {
   allOrderOccurrences.forEach(om => {
     if (!seenOrders.has(om.orderNumber)) {
       seenOrders.add(om.orderNumber);
-      distinctOrders.push(om);
+      distinctOrders.push({ ...om });
+    } else {
+      const existing = distinctOrders.find(d => d.orderNumber === om.orderNumber);
+      if (existing && !existing.filial && om.filial) {
+        existing.filial = om.filial;
+      }
     }
   });
 
@@ -1420,13 +1481,15 @@ export function splitIntoStores(text: string): StoreSegment[] {
   const destMatch = /Loja\s+Destino[\s\S]{1,60}?(MDC[^\n\r]*|FERREIRA\s+COSTA[^\n\r]*)/i.exec(text);
   const carajasMatch = /Ref\.:\s*(?:\(Referência do Local\)\s*)?([^\n\r]+)/i.exec(text);
   const cfSingleMatch = /Filial(?:\s+de\s+destino)?:\s*([^\n\r\/]+)/i.exec(text);
+  const acmMatch = /Razão\s+Social\s+([A-Z0-9\s\.\-—–]+?)(?:\s+CNPJ|\s+IE|\s+UF|\n|\r)/i.exec(text);
   const singleCnpj = extractCnpjFromText(text);
   
   let defaultLabel = 'Loja Principal';
   if (singleOrder) {
     const filialStr = singleOrder.filial ? ` · Filial ${singleOrder.filial}` : '';
     const madStr = fcHeaderMatch ? ` · TRAMONTINA MAD ${fcHeaderMatch[1]}` : '';
-    defaultLabel = `OC ${singleOrder.orderNumber}${filialStr}${madStr}`;
+    const acmStr = acmMatch && !acmMatch[1].toUpperCase().includes('TRAMONTINA') ? ` — ${acmMatch[1].trim()}` : '';
+    defaultLabel = `OC ${singleOrder.orderNumber}${filialStr}${madStr}${acmStr}`;
   } else if (fcHeaderMatch && destMatch) {
     defaultLabel = `TRAMONTINA MAD ${fcHeaderMatch[1]} — ${destMatch[1].trim()}`;
   } else if (fcHeaderMatch) {
@@ -1437,6 +1500,8 @@ export function splitIntoStores(text: string): StoreSegment[] {
     defaultLabel = carajasMatch[1].trim();
   } else if (cfSingleMatch) {
     defaultLabel = cfSingleMatch[1].trim();
+  } else if (acmMatch && !acmMatch[1].toUpperCase().includes('TRAMONTINA')) {
+    defaultLabel = acmMatch[1].trim();
   } else if (singleCnpj) {
     defaultLabel = `CNPJ: ${singleCnpj}`;
   }
@@ -1447,6 +1512,32 @@ export function splitIntoStores(text: string): StoreSegment[] {
     cnpj: singleCnpj,
     orderNumber: singleOrder ? singleOrder.orderNumber : undefined
   }];
+}
+
+/**
+ * Detecta linhas de cabeçalho, endereço, dados cadastrais e rodapés que não contêm produtos
+ */
+export function isMetadataOrHeaderLine(line: string): boolean {
+  const l = line.trim();
+  if (/^(?:Comprador|Transportadora|Dados\s+do|Endere[çc]o|Bairro|Cidade|Telefone|FAX|CNPJ|Inscri[çc][ãa]o|Filial|Dt\.|Tipo\s+Frete|Verbas:|e-mail|N[ºo°]\s*Pedido|Tipo\s+Pedido|Prd\.\s+R103|Qt\.\s*Itens|Total\s+L[íi]quido|Tipo:\s*Simplificado|\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2})/i.test(l)) {
+    return true;
+  }
+  if (/\b(?:RODOVIA|AVENIDA|AV\.|RUA|ALAMEDA|ESTRADA|CEP|BAIRRO|VILA|JARDIM|CENTRO)\b/i.test(l) && /\b\d{8}\b/.test(l)) {
+    return true;
+  }
+  if (/\b\d{8}\b\s+[A-Z\s]+?\b(?:AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b/i.test(l)) {
+    return true;
+  }
+  if (/@|e-mail|NUMPED\s+\d+|DTVENC|PRAZO\s+\d+/i.test(l)) {
+    return true;
+  }
+  if (/^P[áa]gina\s+\d+\s+de\s+\d+/i.test(l)) {
+    return true;
+  }
+  if (/^\d+\s+TRAMONTINA\s+[A-Z\s]+(?:LTDA|S\/A|S\.A\.)/i.test(l)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1511,9 +1602,9 @@ export function extractSkusFromText(
 
     // Se o parser de linha capturou itens com alta densidade, usamos esses resultados
     if (storeItems.length > 0) {
-      // Linhas não processadas com produtos em formato livre
+      // Linhas não processadas com produtos em formato livre (ignorando metadados e cabeçalhos)
       const unprocessedText = lines
-        .filter((_, idx) => !processedLineIndices.has(idx))
+        .filter((l, idx) => !processedLineIndices.has(idx) && !isMetadataOrHeaderLine(l))
         .join('\n');
 
       const extractor = mode === 'ean' ? extractEanCodes : mode === 'ref' ? extractReferenceCodes : extractAutoCodes;
