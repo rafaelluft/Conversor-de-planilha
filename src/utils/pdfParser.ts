@@ -79,6 +79,7 @@ export async function extractTextFromPdf(file: File): Promise<{ text: string; pa
 
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
+      const viewport = page.getViewport({ scale: 1.0 });
       const content = await page.getTextContent();
       
       interface TextItemWithPos {
@@ -94,40 +95,110 @@ export async function extractTextFromPdf(file: File): Promise<{ text: string; pa
       content.items.forEach((it: any) => {
         if (!it.str || it.str.trim() === '') return;
         rawSequentialText += it.str + ' ';
-        const x = it.transform ? it.transform[4] : 0;
-        const y = it.transform ? it.transform[5] : 0;
+        const tx = it.transform ? it.transform[4] : 0;
+        const ty = it.transform ? it.transform[5] : 0;
+        let vx = tx;
+        let vy = ty;
+        if (viewport && typeof viewport.convertToViewportPoint === 'function') {
+          const pt = viewport.convertToViewportPoint(tx, ty);
+          vx = pt[0];
+          vy = pt[1];
+        }
         const height = it.height || (it.transform ? Math.abs(it.transform[0]) : 10);
-        items.push({ str: it.str, x, y, height });
+        items.push({ str: it.str.trim(), x: Math.round(vx), y: Math.round(vy), height });
       });
 
-      // Agrupa itens em linhas por proximidade de coordenada Y (tolerância ~4.0pt)
-      const lineBuckets: Array<{ y: number; items: TextItemWithPos[] }> = [];
-      const Y_TOLERANCE = 4.0;
+      let structuredPageText = '';
 
-      items.forEach(item => {
-        let bucket = lineBuckets.find(b => Math.abs(b.y - item.y) <= Y_TOLERANCE);
-        if (!bucket) {
-          bucket = { y: item.y, items: [] };
-          lineBuckets.push(bucket);
+      // Verifica se a página contém tabela com cabeçalho de embalagem explícita (ex: "Qtde.Emb" ou "Qtd. Emb")
+      const embHeader = items.find(it => /Qtde\.?\s*Emb/i.test(it.str));
+
+      if (embHeader) {
+        const headerVy = embHeader.y;
+        const footerVy = items.find(it => it.y > headerVy + 10 && /^(?:TOTAIS|TOTAL DO PEDIDO|OBSERVAÇÕES|DADOS ADICIONAIS)/i.test(it.str))?.y || 999999;
+
+        const preTableItems = items.filter(it => it.y <= headerVy + 6);
+        const tableItems = items.filter(it => it.y > headerVy + 6 && it.y < footerVy);
+        const postTableItems = items.filter(it => it.y >= footerVy);
+
+        const bucketLines = (itemList: TextItemWithPos[]) => {
+          const buckets: Array<{ y: number; items: TextItemWithPos[] }> = [];
+          itemList.forEach(item => {
+            let bucket = buckets.find(b => Math.abs(b.y - item.y) <= 4.0);
+            if (!bucket) {
+              bucket = { y: item.y, items: [] };
+              buckets.push(bucket);
+            }
+            bucket.items.push(item);
+          });
+          buckets.sort((a, b) => a.y - b.y);
+          const lines: string[] = [];
+          buckets.forEach(bucket => {
+            bucket.items.sort((a, b) => a.x - b.x);
+            const lineStr = bucket.items.map(it => it.str).join(' ');
+            if (lineStr.length > 0) lines.push(lineStr);
+          });
+          return lines;
+        };
+
+        const preLines = bucketLines(preTableItems);
+
+        // Agrupa itens de cada produto dentro da região da tabela
+        const rowStarters = tableItems.filter(it => 
+          (/^\d{13}$/.test(it.str) || /^\d{7,8}$/.test(it.str) || /^\d{1,5}$/.test(it.str)) && it.x < 250
+        );
+        const rowYs = Array.from(new Set(rowStarters.map(it => it.y))).sort((a, b) => a - b);
+        const distinctRowYs: number[] = [];
+        rowYs.forEach(y => {
+          if (!distinctRowYs.some(dy => Math.abs(dy - y) <= 6)) {
+            distinctRowYs.push(y);
+          }
+        });
+
+        const tableLines: string[] = [];
+        for (let r = 0; r < distinctRowYs.length; r++) {
+          const curY = distinctRowYs[r];
+          const nextY = r + 1 < distinctRowYs.length ? distinctRowYs[r + 1] : footerVy;
+          const rItems = tableItems.filter(it => it.y >= curY - 3 && it.y < nextY - 3);
+          rItems.sort((a, b) => a.x - b.x);
+          const lineStr = rItems.map(it => it.str).join(' ');
+          if (lineStr.length > 0) tableLines.push(lineStr);
         }
-        bucket.items.push(item);
-      });
 
-      // Ordena linhas de cima para baixo (Y decrescente no espaço do PDF)
-      lineBuckets.sort((a, b) => b.y - a.y);
+        const postLines = bucketLines(postTableItems);
+        const rawPageText = [...preLines, ...tableLines, ...postLines].join('\n');
+        structuredPageText = rejoinBrokenCodes(rawPageText);
+      } else {
+        // Agrupa itens em linhas por proximidade de coordenada Y (tolerância ~4.0pt)
+        const lineBuckets: Array<{ y: number; items: TextItemWithPos[] }> = [];
+        const Y_TOLERANCE = 4.0;
 
-      const pageLines: string[] = [];
-      lineBuckets.forEach(bucket => {
-        // Ordena palavras dentro da mesma linha da esquerda para a direita (X crescente)
-        bucket.items.sort((a, b) => a.x - b.x);
-        const lineStr = bucket.items.map(it => it.str.trim()).join(' ');
-        if (lineStr.length > 0) {
-          pageLines.push(lineStr);
-        }
-      });
+        items.forEach(item => {
+          let bucket = lineBuckets.find(b => Math.abs(b.y - item.y) <= Y_TOLERANCE);
+          if (!bucket) {
+            bucket = { y: item.y, items: [] };
+            lineBuckets.push(bucket);
+          }
+          bucket.items.push(item);
+        });
 
-      const rawPageText = pageLines.join('\n');
-      const structuredPageText = rejoinBrokenCodes(rawPageText);
+        // Ordena linhas de cima para baixo no viewport visual
+        lineBuckets.sort((a, b) => a.y - b.y);
+
+        const pageLines: string[] = [];
+        lineBuckets.forEach(bucket => {
+          // Ordena palavras dentro da mesma linha da esquerda para a direita (X crescente)
+          bucket.items.sort((a, b) => a.x - b.x);
+          const lineStr = bucket.items.map(it => it.str).join(' ');
+          if (lineStr.length > 0) {
+            pageLines.push(lineStr);
+          }
+        });
+
+        const rawPageText = pageLines.join('\n');
+        structuredPageText = rejoinBrokenCodes(rawPageText);
+      }
+
       if (structuredPageText.trim().length > 0) {
         fullDocumentText += structuredPageText + '\n\n';
       } else if (rawSequentialText.trim().length > 0) {
@@ -247,6 +318,15 @@ export function rejoinBrokenCodes(text: string): string {
         continue;
       }
 
+      // 1.7 Linha termina com "REF:" ou "REF: -" e a próxima começa com código/referência
+      if (/(?:REF(?:ER[EÊ]NCIA)?|C[OÓ]D(?:IGO)?|MATERIAL|SKU)[:\.\s#-]+$/i.test(curr) &&
+          /^(?:[0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8})\b/.test(next)) {
+        curr = `${curr} ${next}`;
+        i++;
+        merged = true;
+        continue;
+      }
+
       if (!merged) break;
     }
 
@@ -331,15 +411,62 @@ export function rejoinBrokenCodes(text: string): string {
     step2Lines.push(curr);
   }
 
+  // PASSO 2B: Junção de Itens Multilinha Consinco / Savegnago (RelPedSuprim.QRP)
+  // Linha 1: [Cod Forn] <Desc Início> <CX|UN|...> <Emb> <Qtde> <Preço Unit> <Valor Item> ...
+  // Linhas seguintes: Continuação da Descrição e REF: <SKU Tramontina>
+  const consincoRowStart = /^(\d{4,8})\s+(.+?)\s+(CX|UN|UND|CJ|JG|PC|PÇ|CT|FD|PCT)\s+([1-9]\d{0,2})\s+(\d+(?:[,\.]\d{1,4})?)\s+(\d+(?:[,\.]\d{2,4})?)\s+(\d+(?:[,\.]\d{2,4})?)/i;
+  const step2bLines: string[] = [];
+
+  for (let i = 0; i < step2Lines.length; i++) {
+    let curr = step2Lines[i];
+    
+    // Ignora linhas de formatos específicos como Rotina 211
+    if (/\b(?:1UN\s+UN|R103|NUMPED)\b/i.test(curr)) {
+      step2bLines.push(curr);
+      continue;
+    }
+
+    const match = consincoRowStart.exec(curr);
+    const hasRefAlready = /(?:REF:?|REF\.?)\s*([0-9]{5}[\/\-\.]?[0-9]{2,3})/i.test(curr) ||
+                          /\b(?:789|790)\d{10}\b/.test(curr);
+
+    if (match && !hasRefAlready) {
+      let j = i + 1;
+      const extraParts: string[] = [];
+      while (j < step2Lines.length && (j - i) <= 5) {
+        const nextL = step2Lines[j];
+        if (consincoRowStart.test(nextL) ||
+            /^(?:TOTAIS|DADOS\s+ADICIONAIS|Consinco|PEDIDO\s+DE\s+COMPRAS|FORNECEDOR|R\.\s*Social|Transportador|Cod\s+Forn)/i.test(nextL)) {
+          break;
+        }
+        extraParts.push(nextL);
+        j++;
+      }
+      if (extraParts.length > 0) {
+        i = j - 1;
+        const fullDesc = extraParts.join(' ');
+        const codForn = match[1];
+        const descPart = match[2];
+        const unit = match[3];
+        const emb = match[4];
+        const qtd = match[5];
+        const preco = match[6];
+        const rest = curr.slice(match[0].length);
+        curr = `${codForn} ${descPart} ${fullDesc} ${unit} ${emb} ${qtd} ${preco} ${rest}`;
+      }
+    }
+    step2bLines.push(curr);
+  }
+
   // PASSO 3: Reconstrução de Linhas de Produto Fragmentadas em Múltiplas Linhas
   // (Ex: Cód Forn / EAN na linha 1, Descrição/Unidade na linha 2, Embalagem/Qtd nas linhas seguintes, Preço no final)
   const finalLines: string[] = [];
-  for (let i = 0; i < step2Lines.length; i++) {
-    let curr = step2Lines[i];
+  for (let i = 0; i < step2bLines.length; i++) {
+    let curr = step2bLines[i];
 
     // Se a linha atual é apenas uma referência Tramontina isolada (ex: "23183/300") e a próxima começa com EAN
-    if (i + 1 < step2Lines.length && /^(?:[0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8}|-)$/.test(curr)) {
-      const nextLine = step2Lines[i + 1];
+    if (i + 1 < step2bLines.length && /^(?:[0-9]{5}[\/\-\.][0-9]{2,3}|[0-9]{7,8}|-)$/.test(curr)) {
+      const nextLine = step2bLines[i + 1];
       if (/^((?:789|790)\d{10}|\d{13})\b/.test(nextLine)) {
         curr = `${curr} ${nextLine}`;
         i++;
@@ -353,8 +480,8 @@ export function rejoinBrokenCodes(text: string): string {
     if (isStart && !hasEnd) {
       let j = i + 1;
       const parts = [curr];
-      while (j < step2Lines.length && (j - i) <= 10) {
-        const nLine = step2Lines[j];
+      while (j < step2bLines.length && (j - i) <= 10) {
+        const nLine = step2bLines[j];
         parts.push(nLine);
         if (/\d+[\.,]\d{2}\s+[\d\.,]+\s+[\d\.,]+$/.test(nLine)) {
           j++;
@@ -398,28 +525,59 @@ export function parseTabularLine(line: string): {
   if (!cleanLine) return null;
 
   // ----------------------------------------------------
-  // MODELO 0A: Supermercados / Atacados / Altiplano
-  // Estrutura: [Item / Código / Descrição] <Quantidade> <Qtd. Emb> <Unidade> <Preço Unitário> [Total...]
-  // Coluna 4 = Quantidade (ex: 60,00 ou 12)
-  // Coluna 5 = Qtd. Emb (ex: 12 ou 6)
-  // Coluna 6 = Unidade (UN, CX, CJ, JG, PC, CT, etc.)
-  // Coluna 7 = Preço Unitário (ex: 10,4000 ou 24,70)
-  // Ex: "1 22902/105 FACA PEIXEIRA INOX 5 60,00 12 UN 10,4000 7,80 624,00"
-  // Ex: "2 20260724 FRIGIDEIRA 24CM TURIM 24,00 6 UN 24,7000 592,80"
-  // Ex: "3 7891112003019 FACA CARNE 8 120,00 24 UN 15,9000 1908,00"
-  // Ex: "0004 000123 23180/004 FACA CHURRASCO LEME 360,00 60 CX 1,8500 0,00 666,00"
+  // MODELO 0A: Supermercados / Atacados / Altiplano / Jaú Serve
+  // Suporta:
+  // 1. [Item/Código/Descr/Ref] <Unidade> <Qtde> <Qtde.Emb> <Preço/Valor Emb> (Padrão Jaú Serve / Pedido Tramontina)
+  // 2. [Item/Código/Descr/Ref] <Qtde> <Qtd.Emb> <Unidade> <Preço Unitário>
+  // 3. [Item/Código/Descr/Ref] <Qtde> <Unidade> <Qtd.Emb> <Preço Unitário>
   // ----------------------------------------------------
-  const altiplanoRegex = /^(.+?)\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)\s*[\-\/]?\s*(UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)(?:\s+[\d\.,]+)*$/i;
-  const altiplanoUnitFirstRegex = /^(.+?)\s+(\d+(?:[\.,]\d+)?)\s*[\-\/]?\s*(UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)(?:\s+[\d\.,]+)*$/i;
+  const altiplanoUnitPrecededRegex = /^(.+?)\s*[\-\/]?\s*(UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)\s+([\d\.,]+)(?:\s+[\d\.,]+)*$/i;
+  const altiplanoRegex = /^(.+?)\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)\s*[\-\/]?\s*(UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+([\d\.,]+)(?:\s+[\d\.,]+)*$/i;
+  const altiplanoUnitFirstRegex = /^(.+?)\s+(\d+(?:[\.,]\d+)?)\s*[\-\/]?\s*(UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)\s+([\d\.,]+)(?:\s+[\d\.,]+)*$/i;
 
-  const altiplanoMatch = altiplanoRegex.exec(cleanLine);
-  const altiplanoUnitFirstMatch = !altiplanoMatch ? altiplanoUnitFirstRegex.exec(cleanLine) : null;
-  const anyAltiplanoMatch = altiplanoMatch || altiplanoUnitFirstMatch;
+  const altiplanoUnitPrecededMatch = altiplanoUnitPrecededRegex.exec(cleanLine);
+  const altiplanoMatch = !altiplanoUnitPrecededMatch ? altiplanoRegex.exec(cleanLine) : null;
+  let altiplanoUnitFirstMatch = !altiplanoUnitPrecededMatch && !altiplanoMatch ? altiplanoUnitFirstRegex.exec(cleanLine) : null;
+
+  // Se altiplanoUnitFirstMatch capturou um número com 7+ dígitos ou SKU Tramontina na quantidade (ex: Ref.Forn 25499903 antes de CAIXA), descarte
+  if (altiplanoUnitFirstMatch) {
+    const rawQ = altiplanoUnitFirstMatch[2].replace(/[\.,]/g, '');
+    if (rawQ.length >= 7 || isValidTramontinaSku(rawQ) || parsePtBrNumber(altiplanoUnitFirstMatch[2]) >= 100000) {
+      altiplanoUnitFirstMatch = null;
+    }
+  }
+
+  const anyAltiplanoMatch = altiplanoUnitPrecededMatch || altiplanoMatch || altiplanoUnitFirstMatch;
   if (anyAltiplanoMatch) {
+    const isUnitPreceded = Boolean(altiplanoUnitPrecededMatch);
     const isUnitFirst = Boolean(altiplanoUnitFirstMatch);
     const prefix = anyAltiplanoMatch[1].trim();
-    const qtdRaw = anyAltiplanoMatch[2];
-    const embRaw = isUnitFirst ? anyAltiplanoMatch[4] : anyAltiplanoMatch[3];
+    let qtdRaw = isUnitPreceded ? anyAltiplanoMatch[3] : anyAltiplanoMatch[2];
+    let embRaw = isUnitPreceded ? anyAltiplanoMatch[4] : isUnitFirst ? anyAltiplanoMatch[4] : anyAltiplanoMatch[3];
+
+    if (isUnitPreceded) {
+      const uUnit = altiplanoUnitPrecededMatch![2].toUpperCase();
+      const n1 = parsePtBrNumber(anyAltiplanoMatch[3]);
+      const n2 = parsePtBrNumber(anyAltiplanoMatch[4]);
+      const price = parsePtBrNumber(anyAltiplanoMatch[5]);
+      // Extrai números seguintes após o preço para validação matemática de total
+      const afterMatch = cleanLine.slice(anyAltiplanoMatch[0].length).trim().split(/\s+/);
+      const totalCand = afterMatch.length > 0 && afterMatch[0] ? parsePtBrNumber(afterMatch[0]) : 0;
+
+      const mathN2Matches = (price > 0 && totalCand > 0 && Math.abs(n2 * price - totalCand) <= Math.max(0.5, totalCand * 0.05));
+      const mathN1Matches = (price > 0 && totalCand > 0 && Math.abs(n1 * price - totalCand) <= Math.max(0.5, totalCand * 0.05));
+
+      // Se math confirma n2 * price = total (ex: 2,00 * 241,83 = 483,66 em Consinco / Savegnago):
+      if (mathN2Matches && !mathN1Matches) {
+        qtdRaw = anyAltiplanoMatch[4];
+        embRaw = anyAltiplanoMatch[3];
+      } else if (!mathN1Matches && /^\d+$/.test(anyAltiplanoMatch[3]) && (/,\d+$/.test(anyAltiplanoMatch[4]) || /^(?:CX|CXA|UN|UND|CJ|JG|PC|PÇ|CT|FD|PCT)$/i.test(uUnit))) {
+        // Variação explícita: "CX 12", "UN 1", "CX 60"
+        // anyAltiplanoMatch[3] é o fator de embalagem (12 ou 1) e anyAltiplanoMatch[4] é a quantidade (2,00)
+        qtdRaw = anyAltiplanoMatch[4];
+        embRaw = anyAltiplanoMatch[3];
+      }
+    }
 
     const qtd = parsePtBrNumber(qtdRaw);
     const emb = Math.round(parsePtBrNumber(embRaw)) || 1;
@@ -443,10 +601,10 @@ export function parseTabularLine(line: string): {
       if (labeledRef) {
         skuRef = normalizeTramontinaSku(`${labeledRef[1]}/${labeledRef[2]}`);
       } else {
-        // 4. Código contínuo de 8 dígitos válido como SKU Tramontina
+        // 4. Código contínuo de 8 dígitos válido como SKU Tramontina (prioriza o mais próximo da unidade / final do prefixo)
         const all8 = prefix.match(/\b([0-9]{5})([0-9]{3})\b/g);
         if (all8) {
-          const found = all8.find(c => isValidTramontinaSku(c));
+          const found = all8.slice().reverse().find(c => isValidTramontinaSku(c));
           if (found) {
             skuRef = normalizeTramontinaSku(found);
           }
@@ -714,7 +872,7 @@ export function parseTabularLine(line: string): {
     return {
       isMatch: true,
       skuRef: normalizeTramontinaSku(rawRef),
-      embalagem: unitType === 'CX' ? emb : 1,
+      embalagem: emb || 1,
       quantidade: qtd
     };
   }
@@ -991,7 +1149,7 @@ export function attachPackagingAndQuantity(
   const WINDOW = 280;
   const isCxaMastFormat = /Cxa\s*Mast/i.test(text);
   const boxQtyFirstLabel = '(?:CX|CAIXA|EMB(?:ALAGEM)?|BOX)';
-  const boxLabel = isCxaMastFormat ? '(?:CX|CAIXA|EMB(?:ALAGEM)?|UN|UND|UNID(?:ADE)?|BOX)' : '(?:CX|CAIXA|EMB(?:ALAGEM)?|BOX)';
+  const boxLabel = '(?:CX|CXA|CAIXA|UN|UND|UNID(?:ADE)?|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO|EMB(?:ALAGEM)?|BOX)';
   const unitLabel = isCxaMastFormat ? '(?:CJ|CT|JG|PC|PÇ)' : '(?:UN|UND|UNID(?:ADE)?|CJ|CT|JG|PC|PÇ|PE[CÇ]A|FD|PCT)';
   const SEP = '[\\s:\\-\\|]*';
 
@@ -1002,7 +1160,7 @@ export function attachPackagingAndQuantity(
   const unitQtyBefore = new RegExp('(?:^|[^Xx0-9])(\\d+(?:[,\.]\d+)?)\\s*' + unitLabel + '\\b(?!-)', 'i');
   
   // Rótulos diretos de Embalagem e Quantidade
-  const embOnlyRegex = /\b(?:EMB(?:ALAGEM)?|CXA?\.?|CAIXA|M[UÚ]LT(?:IPLO)?|FATOR)\s*[:=\-]?\s*(\d+)/i;
+  const embOnlyRegex = /\b(?:QTDE?\.?\s*EMB(?:ALAGEM)?|QTD\.?\s*EMB|EMB(?:ALAGEM)?|CXA?\.?|CAIXA|M[UÚ]LT(?:IPLO)?|FATOR)\s*[:=\-]?\s*(\d+(?:[,\.]\d+)?)/i;
   const qtdOnlyRegex = /\b(?:QTDE?|QUANT(?:IDADE)?|QUANT\.?|QT\.?\s*PED(?:IDO)?|SOLIC(?:ITADA)?|QTD\.?|QTD)\s*[:=\-]?\s*(\d+(?:[,\.]\d+)?)/i;
   
   const packLandmark = /(\d+(?:[,\.]\d+)?)\s+(UN|JG|CJ|CT|PC|PÇ|CX|FD|PCT)-(\d+)-\2\b/i;
@@ -1042,6 +1200,36 @@ export function attachPackagingAndQuantity(
       if (/^(?:789|790)\d+/.test(s)) return false;
       if (s.length >= 5) return false;
       return true;
+    }
+
+    // Padrão <Unidade> <Quantidade> <Qtd. Emb> (ex: "CAIXA 5,00 12,00")
+    // e Variação <Unidade> <Emb> <Quantidade> (ex: "CX 12 2,00", "UN 1 10,00", "CX 60 7,00")
+    const unitQtyEmbSeq = /\b(?:UN|UND|UNID(?:ADE)?|CX|CXA|CAIXA|CJ|CJO|CONJ(?:UNTO)?|JG|JGO|JOGO|PC|PÇ|P[CÇ]A|PE[CÇ]A|CT|CRT|CART(?:ELA)?|FD|FARDO|PCT|PACOTE|PAR|KIT|RL|ROLO|BL|BLOCO)\.?\b\s+(\d+(?:[\.,]\d+)?)\s+(\d+(?:[\.,]\d+)?)/gi;
+    let uSeqM: RegExpExecArray | null;
+    while ((uSeqM = unitQtyEmbSeq.exec(win)) !== null) {
+      const uUnit = uSeqM[0].split(/\s+/)[0].toUpperCase();
+      const raw1 = uSeqM[1];
+      const raw2 = uSeqM[2];
+      const n1 = parsePtBrNumber(raw1);
+      const n2 = parsePtBrNumber(raw2);
+
+      let q = n1;
+      let e = Math.round(n2) || 1;
+
+      // Variação explícita "CX 12" ou "UN 1":
+      // se o primeiro número for inteiro (embalagem/fator) e o segundo for decimal ou quantidade
+      if (/^\d+$/.test(raw1) && (/,\d+$/.test(raw2) || /^(?:CX|CXA|UN|UND|CJ|JG|PC|PÇ|CT|FD|PCT)$/i.test(uUnit))) {
+        e = Math.round(n1) || 1;
+        q = n2;
+      }
+
+      if (isValidCandidateQty(q) && isValidCandidateEmb(e)) {
+        candidates.push({
+          pos: uSeqM.index,
+          len: uSeqM[0].length,
+          data: { quantidade: q, embalagem: e }
+        });
+      }
     }
 
     // Padrão Altiplano / Supermercado no texto livre: <Quantidade> <Qtd. Emb> <Unidade> <Preço Unitário>
@@ -1481,7 +1669,7 @@ export function splitIntoStores(text: string): StoreSegment[] {
   const destMatch = /Loja\s+Destino[\s\S]{1,60}?(MDC[^\n\r]*|FERREIRA\s+COSTA[^\n\r]*)/i.exec(text);
   const carajasMatch = /Ref\.:\s*(?:\(Referência do Local\)\s*)?([^\n\r]+)/i.exec(text);
   const cfSingleMatch = /Filial(?:\s+de\s+destino)?:\s*([^\n\r\/]+)/i.exec(text);
-  const acmMatch = /Razão\s+Social\s+([A-Z0-9\s\.\-—–]+?)(?:\s+CNPJ|\s+IE|\s+UF|\n|\r)/i.exec(text);
+  const acmMatch = /(?:Razão\s+Social|Cliente|Destinatário)\s*[:\s]+([A-Z0-9\s\.\-—–]+?)(?:\s+Centro|\s+Telefone|\s+Endereço|\s+CNPJ|\s+IE|\s+UF|\n|\r)/i.exec(text);
   const singleCnpj = extractCnpjFromText(text);
   
   let defaultLabel = 'Loja Principal';
@@ -1519,7 +1707,7 @@ export function splitIntoStores(text: string): StoreSegment[] {
  */
 export function isMetadataOrHeaderLine(line: string): boolean {
   const l = line.trim();
-  if (/^(?:Comprador|Transportadora|Dados\s+do|Endere[çc]o|Bairro|Cidade|Telefone|FAX|CNPJ|Inscri[çc][ãa]o|Filial|Dt\.|Tipo\s+Frete|Verbas:|e-mail|N[ºo°]\s*Pedido|Tipo\s+Pedido|Prd\.\s+R103|Qt\.\s*Itens|Total\s+L[íi]quido|Tipo:\s*Simplificado|\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2})/i.test(l)) {
+  if (/^(?:Comprador|Transportadora|Dados\s+do|Endere[çc]o|Bairro|Cidade|Telefone|FAX|CNPJ|Inscri[çc][ãa]o|Filial|Dt\.|Tipo\s+Frete|Verbas:|e-mail|N[ºo°]\s*Pedido|Tipo\s+Pedido|Prd\.\s+R103|Qt\.\s*Itens|Total\s+L[íi]quido|Tipo:\s*Simplificado|C[óo]d\.?\s*Fornecedor|Centro:|Prazo\s+para|Data\s+da\s+Emiss[ãa]o|Previs[ãa]o\s+de\s+Entrega|Peso\s+(?:Bruto|L[íi]quido)|Volume\s+Total|TOTAIS|\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2})/i.test(l)) {
     return true;
   }
   if (/\b(?:RODOVIA|AVENIDA|AV\.|RUA|ALAMEDA|ESTRADA|CEP|BAIRRO|VILA|JARDIM|CENTRO)\b/i.test(l) && /\b\d{8}\b/.test(l)) {
@@ -1535,6 +1723,9 @@ export function isMetadataOrHeaderLine(line: string): boolean {
     return true;
   }
   if (/^\d+\s+TRAMONTINA\s+[A-Z\s]+(?:LTDA|S\/A|S\.A\.)/i.test(l)) {
+    return true;
+  }
+  if (/\bCEP[:\s]*\d{5}[-\.]\d{3}\b/i.test(l)) {
     return true;
   }
   return false;
